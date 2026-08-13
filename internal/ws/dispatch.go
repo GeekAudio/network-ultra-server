@@ -4,29 +4,36 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
-	"github.com/google/uuid"
 	"github.com/coder/websocket"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/GeekASMR/network-ultra-server/internal/metrics"
 	"github.com/GeekASMR/network-ultra-server/internal/proto"
+	"github.com/GeekASMR/network-ultra-server/internal/ratelimit"
 	"github.com/GeekASMR/network-ultra-server/internal/room"
 )
 
 const (
-	serverVersion       = "1.0.0"
 	writeTimeout        = 10 * time.Second // single frame write deadline; tolerant of 500ms RTT stalls
 	helloTimeout        = 10 * time.Second
 	pingTimeout         = 30 * time.Second
 	connWriteQueueDepth = 1024 // ~10s of audio at 100 fps; absorbs long-RTT bursts
 )
+
+var errPasswordWorkBusy = errors.New("password verification busy")
 
 type Server struct {
 	Reg     *room.Registry
@@ -35,6 +42,11 @@ type Server struct {
 
 	// Limits
 	MaxConnections int
+	RateLimits     RateLimits
+	Version        string
+	// TrustedProxyPrefixes gates use of Forwarded/X-Forwarded-For. Empty is
+	// fail-closed: transport RemoteAddr is always used.
+	TrustedProxyPrefixes []netip.Prefix
 
 	// Optional: the WS subprotocol clients must request.
 	Subprotocol string
@@ -56,14 +68,47 @@ type Server struct {
 	UdpPort int
 
 	// UDP data plane (optional). When set, the WS welcome message advertises
-	// the UDP endpoint + a per-peer HMAC token; clients that successfully
+	// the UDP endpoint + a per-session random token; clients that successfully
 	// handshake on UDP will route audio there. Nil means UDP is disabled
 	// and all audio continues to flow over WebSocket binary frames.
 	Udp UdpAdvertiser
 
 	// stats
-	curConns int64
-	mu       sync.Mutex
+	curConns     int64
+	mu           sync.Mutex
+	securityOnce sync.Once
+	helloLimiter *ratelimit.Limiter
+	peerLimiter  *ratelimit.Limiter
+	passwordSem  chan struct{}
+}
+
+type RateLimits struct {
+	HelloPerIPPerMinute        int
+	RoomCreatePerPeerPerMinute int
+	RoomJoinPerPeerPerMinute   int
+	RoomListPerPeerPerMinute   int
+	ControlPerPeerPerMinute    int
+	AudioFramesPerPeerPerSec   int
+	PasswordChecksConcurrent   int
+}
+
+func (s *Server) initSecurity() {
+	s.securityOnce.Do(func() {
+		s.helloLimiter = ratelimit.New()
+		s.peerLimiter = ratelimit.New()
+		cap := s.RateLimits.PasswordChecksConcurrent
+		if cap <= 0 {
+			cap = 4
+		}
+		s.passwordSem = make(chan struct{}, cap)
+	})
+}
+
+func (s *Server) version() string {
+	if s.Version == "" {
+		return "dev"
+	}
+	return s.Version
 }
 
 // UdpAdvertiser is the small interface the WS layer needs from the UDP
@@ -72,13 +117,23 @@ type Server struct {
 // ws package doesn't import the udp package directly (which would create
 // an import cycle since udp imports room).
 type UdpAdvertiser interface {
-	MintToken(peerID uuid.UUID) string
+	MintToken(peerID uuid.UUID) (string, error)
 	AttachPeer(p *room.Peer)
 	DetachPeer(p *room.Peer)
 }
 
 // HandleHTTP upgrades incoming HTTP into a WebSocket connection and runs it.
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
+	// This endpoint is exclusively for native clients. Reject every browser
+	// Origin, including a value that matches Host: DNS rebinding or a forged
+	// Host header must not turn the native control plane into a browser API.
+	for _, origin := range r.Header.Values("Origin") {
+		if strings.TrimSpace(origin) != "" {
+			http.Error(w, "browser websocket origins are forbidden", http.StatusForbidden)
+			return
+		}
+	}
+	s.initSecurity()
 	// Per-process cap.
 	s.mu.Lock()
 	if int(s.curConns) >= s.MaxConnections {
@@ -95,9 +150,9 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}()
 
-	opts := &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // we don't validate origin; clients are VST hosts
-	}
+	// Keep coder/websocket's own checks as defense in depth. The explicit gate
+	// above is stricter and allows only native clients that omit Origin.
+	opts := &websocket.AcceptOptions{}
 	if s.Subprotocol != "" {
 		opts.Subprotocols = []string{s.Subprotocol}
 	}
@@ -108,13 +163,18 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer c.Close(websocket.StatusInternalError, "shutting down")
+	// Control envelopes are small and audio frames are capped below 9 KiB.
+	// A modest connection-level cap prevents a single peer from forcing an
+	// 8 MiB allocation before field validation runs.
+	c.SetReadLimit(64 * 1024)
 
 	s.Metrics.Counter("nu_ws_connections_total").Inc()
 
 	conn := newConn(c, s.Log)
 	defer conn.close()
 
-	if err := s.run(r.Context(), conn, r.RemoteAddr, r.Host); err != nil {
+	remoteIP := s.clientIP(r)
+	if err := s.run(r.Context(), conn, remoteIP, r.Host); err != nil {
 		s.Log.Debug("session ended", "err", err, "remote", r.RemoteAddr)
 	}
 }
@@ -125,7 +185,7 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 // "175.178.62.76:18900"). We use just the host part to advertise the UDP
 // endpoint, so clients connecting via "localhost", "127.0.0.1", a public
 // IP, or a domain all get back a UDP host they can actually reach.
-func (s *Server) run(parent context.Context, conn *Conn, remote, hostHeader string) error {
+func (s *Server) run(parent context.Context, conn *Conn, remoteIP, hostHeader string) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -140,6 +200,13 @@ func (s *Server) run(parent context.Context, conn *Conn, remote, hostHeader stri
 	if mt != websocket.MessageText {
 		return s.protoError(conn, "first frame must be hello (text)")
 	}
+	if !utf8.Valid(payload) {
+		return s.protoError(conn, "hello must be valid UTF-8")
+	}
+	if !s.helloLimiter.Allow(remoteIP, s.RateLimits.HelloPerIPPerMinute, time.Minute) {
+		s.sendError(conn, "", proto.ErrRateLimited, "too many hello attempts")
+		return errors.New("hello rate limited")
+	}
 
 	env, err := proto.Decode(payload)
 	if err != nil || env.Type != proto.TypeHello || env.V > proto.ProtocolVersion {
@@ -153,6 +220,10 @@ func (s *Server) run(parent context.Context, conn *Conn, remote, hostHeader stri
 		s.sendError(conn, env.ID, proto.ErrBadUsername, "username invalid")
 		return errors.New("bad username")
 	}
+	hello.Username = strings.TrimSpace(hello.Username)
+	if len([]byte(hello.ServerPassword)) > proto.MaxPasswordBytes {
+		return s.protoError(conn, "serverPassword exceeds bcrypt 72-byte limit")
+	}
 
 	// v1.3+ server-level password gating. Empty hash = open server (legacy).
 	// Empty client-supplied password against a non-empty hash => "required".
@@ -163,30 +234,30 @@ func (s *Server) run(parent context.Context, conn *Conn, remote, hostHeader stri
 				"this server requires a password; please set it in the client and reconnect")
 			return errors.New("server password required")
 		}
-		if err := bcrypt.CompareHashAndPassword(s.ServerPasswordHash, []byte(hello.ServerPassword)); err != nil {
+		passwordErr := s.doPasswordWork(func() error {
+			return bcrypt.CompareHashAndPassword(s.ServerPasswordHash, []byte(hello.ServerPassword))
+		})
+		if errors.Is(passwordErr, errPasswordWorkBusy) {
+			s.sendError(conn, env.ID, proto.ErrRateLimited, "password verification busy")
+			return errors.New("password verification saturated")
+		}
+		if passwordErr != nil {
 			s.sendError(conn, env.ID, proto.ErrBadServerPassword, "bad server password")
 			return errors.New("bad server password")
 		}
 	}
 
 	peer := room.NewPeer(hello.Username, "")
+	peer.RemoteIP = remoteIP
 	s.Metrics.Gauge("nu_active_peers").Inc()
 	defer s.Metrics.Gauge("nu_active_peers").Dec()
 
 	peer.AttachSender(conn.SendFunc())
 	defer peer.DetachSender()
 
-	// Register the peer with the UDP data plane (if enabled). DetachPeer
-	// runs alongside DetachSender on disconnect so we don't keep stale
-	// UDP bindings.
-	if s.Udp != nil {
-		s.Udp.AttachPeer(peer)
-		defer s.Udp.DetachPeer(peer)
-	}
-
 	welcome := proto.WelcomeData{
 		PeerID:        peer.ID.String(),
-		ServerVersion: serverVersion,
+		ServerVersion: s.version(),
 	}
 	if s.Udp != nil {
 		// Resolve the UDP endpoint to advertise. Priority:
@@ -210,15 +281,24 @@ func (s *Server) run(parent context.Context, conn *Conn, remote, hostHeader stri
 			}
 		}
 		if welcome.UdpEndpoint != "" {
-			welcome.UdpToken = s.Udp.MintToken(peer.ID)
+			welcome.UdpToken, err = s.Udp.MintToken(peer.ID)
+			if err != nil {
+				return fmt.Errorf("mint UDP token: %w", err)
+			}
 		}
+	}
+	// Register only after token generation succeeds. A failed entropy source
+	// closes this WS session without exposing a half-populated UDP capability or
+	// briefly attaching a peer to the data plane.
+	if s.Udp != nil {
+		s.Udp.AttachPeer(peer)
+		defer s.Udp.DetachPeer(peer)
 	}
 	if err := s.send(conn, proto.TypeWelcome, env.ID, welcome); err != nil {
 		return err
 	}
 
-	host, _, _ := net.SplitHostPort(remote)
-	s.Log.Info("peer authenticated", "peerId", peer.ID, "username", hello.Username, "host", host)
+	s.Log.Info("peer authenticated", "peerId", peer.ID, "username", hello.Username, "host", remoteIP)
 
 	// Server-side WebSocket ping every 15s. Many residential / mobile
 	// networks silently drop idle TCP after ~30s; without a periodic
@@ -260,6 +340,14 @@ func (s *Server) run(parent context.Context, conn *Conn, remote, hostHeader stri
 }
 
 func (s *Server) handleControl(ctx context.Context, conn *Conn, peer *room.Peer, payload []byte) {
+	if !s.allowPeer(peer, "control", s.RateLimits.ControlPerPeerPerMinute, time.Minute) {
+		s.sendError(conn, "", proto.ErrRateLimited, "control message rate exceeded")
+		return
+	}
+	if !utf8.Valid(payload) {
+		s.sendError(conn, "", proto.ErrProtocolError, "control message must be valid UTF-8")
+		return
+	}
 	env, err := proto.Decode(payload)
 	if err != nil {
 		s.sendError(conn, "", proto.ErrProtocolError, "bad json")
@@ -287,6 +375,10 @@ func (s *Server) handleControl(ctx context.Context, conn *Conn, peer *room.Peer,
 }
 
 func (s *Server) handleAudio(peer *room.Peer, payload []byte) {
+	if !s.allowPeer(peer, "ws_audio", s.RateLimits.AudioFramesPerPeerPerSec, time.Second) {
+		s.Metrics.LabeledCounter("nu_audio_frames_dropped_total", "reason").Inc("rate_limit")
+		return
+	}
 	hdr, audio, err := proto.Unpack(payload)
 	if err != nil {
 		s.Metrics.LabeledCounter("nu_errors_total", "code").Inc(proto.ErrProtocolError)
@@ -300,6 +392,10 @@ func (s *Server) handleAudio(peer *room.Peer, payload []byte) {
 	// Anti-spoof: source must be self.
 	if hdr.SourcePeerID != [16]byte(peer.ID) {
 		s.Metrics.LabeledCounter("nu_errors_total", "code").Inc(proto.ErrProtocolError)
+		return
+	}
+	if peer.Muted() {
+		s.Metrics.LabeledCounter("nu_audio_frames_dropped_total", "reason").Inc("muted")
 		return
 	}
 
@@ -322,6 +418,10 @@ func (s *Server) handleAudio(peer *room.Peer, payload []byte) {
 }
 
 func (s *Server) handleRoomCreate(conn *Conn, peer *room.Peer, env proto.Envelope) {
+	if !s.allowPeer(peer, "room_create", s.RateLimits.RoomCreatePerPeerPerMinute, time.Minute) {
+		s.sendError(conn, env.ID, proto.ErrRateLimited, "room create rate exceeded")
+		return
+	}
 	if peer.CurrentRoom() != nil {
 		s.sendError(conn, env.ID, proto.ErrAlreadyInRoom, "leave first")
 		return
@@ -331,10 +431,35 @@ func (s *Server) handleRoomCreate(conn *Conn, peer *room.Peer, env proto.Envelop
 		s.sendError(conn, env.ID, proto.ErrProtocolError, "bad data")
 		return
 	}
+	if !validRoomName(d.RoomName) {
+		s.sendError(conn, env.ID, proto.ErrProtocolError, "roomName must be 1..64 Unicode characters without control characters")
+		return
+	}
+	d.RoomName = strings.TrimSpace(d.RoomName)
+	if len([]byte(d.Password)) > proto.MaxPasswordBytes {
+		s.sendError(conn, env.ID, proto.ErrProtocolError, "password exceeds bcrypt 72-byte limit")
+		return
+	}
 	if d.Visibility != "public" && d.Visibility != "private" {
 		d.Visibility = "private"
 	}
-	rm, err := s.Reg.Create(d.RoomName, d.Visibility, d.Password)
+	var passwordHash []byte
+	if d.Password != "" {
+		err := s.doPasswordWork(func() error {
+			var hashErr error
+			passwordHash, hashErr = room.HashPassword(d.Password)
+			return hashErr
+		})
+		if errors.Is(err, errPasswordWorkBusy) {
+			s.sendError(conn, env.ID, proto.ErrRateLimited, "password hashing busy")
+			return
+		}
+		if err != nil {
+			s.sendError(conn, env.ID, proto.ErrInternalError, "password hashing failed")
+			return
+		}
+	}
+	rm, err := s.Reg.Create(d.RoomName, d.Visibility, passwordHash)
 	if err != nil {
 		switch err {
 		case room.ErrRoomNameTaken:
@@ -354,6 +479,10 @@ func (s *Server) handleRoomCreate(conn *Conn, peer *room.Peer, env proto.Envelop
 }
 
 func (s *Server) handleRoomJoin(conn *Conn, peer *room.Peer, env proto.Envelope) {
+	if !s.allowPeer(peer, "room_join", s.RateLimits.RoomJoinPerPeerPerMinute, time.Minute) {
+		s.sendError(conn, env.ID, proto.ErrRateLimited, "room join rate exceeded")
+		return
+	}
 	if peer.CurrentRoom() != nil {
 		s.sendError(conn, env.ID, proto.ErrAlreadyInRoom, "leave first")
 		return
@@ -363,14 +492,30 @@ func (s *Server) handleRoomJoin(conn *Conn, peer *room.Peer, env proto.Envelope)
 		s.sendError(conn, env.ID, proto.ErrProtocolError, "bad data")
 		return
 	}
+	if !validRoomName(d.RoomName) {
+		s.sendError(conn, env.ID, proto.ErrProtocolError, "roomName must be 1..64 Unicode characters without control characters")
+		return
+	}
+	d.RoomName = strings.TrimSpace(d.RoomName)
+	if len([]byte(d.Password)) > proto.MaxPasswordBytes {
+		s.sendError(conn, env.ID, proto.ErrProtocolError, "password exceeds bcrypt 72-byte limit")
+		return
+	}
 	rm := s.Reg.Find(d.RoomName)
 	if rm == nil {
 		s.sendError(conn, env.ID, proto.ErrRoomNotFound, "no such room")
 		return
 	}
-	if err := rm.CheckPassword(d.Password); err != nil {
-		s.sendError(conn, env.ID, proto.ErrBadPassword, "bad password")
-		return
+	if rm.HasPassword {
+		err := s.doPasswordWork(func() error { return rm.CheckPassword(d.Password) })
+		if errors.Is(err, errPasswordWorkBusy) {
+			s.sendError(conn, env.ID, proto.ErrRateLimited, "password verification busy")
+			return
+		}
+		if err != nil {
+			s.sendError(conn, env.ID, proto.ErrBadPassword, "bad password")
+			return
+		}
 	}
 	role := d.Role
 	if role != "send" && role != "recv" {
@@ -383,7 +528,11 @@ func (s *Server) joinPeerToRoom(conn *Conn, peer *room.Peer, rm *room.Room, role
 	peer.Role = role
 	others, err := rm.Add(peer)
 	if err != nil {
-		s.sendError(conn, reqID, proto.ErrRoomFull, "room full")
+		if errors.Is(err, room.ErrRoomNotFound) {
+			s.sendError(conn, reqID, proto.ErrRoomNotFound, "room expired before join")
+		} else {
+			s.sendError(conn, reqID, proto.ErrRoomFull, "room full")
+		}
 		return
 	}
 
@@ -428,6 +577,10 @@ func (s *Server) handleRoomLeave(conn *Conn, peer *room.Peer, env proto.Envelope
 }
 
 func (s *Server) handleRoomList(conn *Conn, peer *room.Peer, env proto.Envelope) {
+	if !s.allowPeer(peer, "room_list", s.RateLimits.RoomListPerPeerPerMinute, time.Minute) {
+		s.sendError(conn, env.ID, proto.ErrRateLimited, "room list rate exceeded")
+		return
+	}
 	list := s.Reg.PublicList()
 	wire := make([]proto.RoomListEntry, 0, len(list))
 	for _, e := range list {
@@ -465,11 +618,10 @@ func (s *Server) handleSubscribe(conn *Conn, peer *room.Peer, env proto.Envelope
 		s.sendError(conn, env.ID, proto.ErrProtocolError, "bad data")
 		return
 	}
-	ids := make([]uuid.UUID, 0, len(d.SourcePeerIDs))
-	for _, s := range d.SourcePeerIDs {
-		if id, err := uuid.Parse(s); err == nil {
-			ids = append(ids, id)
-		}
+	ids, err := parseSubscriptionIDs(d.SourcePeerIDs)
+	if err != nil {
+		s.sendError(conn, env.ID, proto.ErrProtocolError, err.Error())
+		return
 	}
 	peer.SetSubscribed(ids)
 	_ = conn
@@ -538,8 +690,64 @@ func (s *Server) protoError(conn *Conn, reason string) error {
 }
 
 func validUsername(u string) bool {
-	if len(u) == 0 || len(u) > 32 {
+	return validHumanLabel(u, proto.MaxUsernameRunes)
+}
+
+func validRoomName(name string) bool {
+	return validHumanLabel(name, proto.MaxRoomNameRunes)
+}
+
+func validHumanLabel(value string, maxRunes int) bool {
+	if !utf8.ValidString(value) {
 		return false
 	}
-	return true // tighter validation can be added; keep MVP loose
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	trimmed := strings.TrimSpace(value)
+	n := utf8.RuneCountInString(trimmed)
+	return n >= 1 && n <= maxRunes
+}
+
+func parseSubscriptionIDs(raw []string) ([]uuid.UUID, error) {
+	if len(raw) > proto.MaxPeersPerRoom {
+		return nil, fmt.Errorf("sourcePeerIds exceeds protocol limit of %d", proto.MaxPeersPerRoom)
+	}
+	ids := make([]uuid.UUID, 0, len(raw))
+	seen := make(map[uuid.UUID]struct{}, len(raw))
+	for _, text := range raw {
+		id, err := uuid.Parse(text)
+		if err != nil {
+			return nil, errors.New("sourcePeerIds contains an invalid UUID")
+		}
+		if _, exists := seen[id]; exists {
+			return nil, errors.New("sourcePeerIds contains a duplicate UUID")
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func (s *Server) allowPeer(peer *room.Peer, action string, limit int, window time.Duration) bool {
+	s.initSecurity()
+	return s.peerLimiter.AllowPair(
+		"peer:"+peer.ID.String()+":"+action,
+		"ip:"+peer.RemoteIP+":"+action,
+		limit,
+		window,
+	)
+}
+
+func (s *Server) doPasswordWork(fn func() error) error {
+	s.initSecurity()
+	select {
+	case s.passwordSem <- struct{}{}:
+		defer func() { <-s.passwordSem }()
+		return fn()
+	default:
+		return errPasswordWorkBusy
+	}
 }

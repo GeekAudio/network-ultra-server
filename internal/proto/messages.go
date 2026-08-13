@@ -14,14 +14,14 @@ const ProtocolVersion = 1
 // Message types
 const (
 	// Client -> Server
-	TypeHello       = "hello"
-	TypeRoomCreate  = "room_create"
-	TypeRoomJoin    = "room_join"
-	TypeRoomLeave   = "room_leave"
-	TypeRoomList    = "room_list"
-	TypePeerMute    = "peer_mute"
-	TypeSubscribe   = "subscribe"
-	TypePing        = "ping"
+	TypeHello      = "hello"
+	TypeRoomCreate = "room_create"
+	TypeRoomJoin   = "room_join"
+	TypeRoomLeave  = "room_leave"
+	TypeRoomList   = "room_list"
+	TypePeerMute   = "peer_mute"
+	TypeSubscribe  = "subscribe"
+	TypePing       = "ping"
 
 	// Server -> Client
 	TypeWelcome         = "welcome"
@@ -38,18 +38,18 @@ const (
 
 // Error codes (v1)
 const (
-	ErrRoomNameTaken         = "ROOM_NAME_TAKEN"
-	ErrRoomNotFound          = "ROOM_NOT_FOUND"
-	ErrRoomFull              = "ROOM_FULL"
-	ErrServerFull            = "SERVER_FULL"
-	ErrBadPassword           = "BAD_PASSWORD"
-	ErrBadUsername           = "BAD_USERNAME"
-	ErrRateLimited           = "RATE_LIMITED"
-	ErrProtocolError         = "PROTOCOL_ERROR"
-	ErrInternalError         = "INTERNAL_ERROR"
-	ErrNotInRoom             = "NOT_IN_ROOM"
-	ErrAlreadyInRoom         = "ALREADY_IN_ROOM"
-	ErrUnsupportedVer        = "UNSUPPORTED_VERSION"
+	ErrRoomNameTaken  = "ROOM_NAME_TAKEN"
+	ErrRoomNotFound   = "ROOM_NOT_FOUND"
+	ErrRoomFull       = "ROOM_FULL"
+	ErrServerFull     = "SERVER_FULL"
+	ErrBadPassword    = "BAD_PASSWORD"
+	ErrBadUsername    = "BAD_USERNAME"
+	ErrRateLimited    = "RATE_LIMITED"
+	ErrProtocolError  = "PROTOCOL_ERROR"
+	ErrInternalError  = "INTERNAL_ERROR"
+	ErrNotInRoom      = "NOT_IN_ROOM"
+	ErrAlreadyInRoom  = "ALREADY_IN_ROOM"
+	ErrUnsupportedVer = "UNSUPPORTED_VERSION"
 	// v1.3+ server-level password gating
 	ErrServerPasswordRequired = "SERVER_PASSWORD_REQUIRED"
 	ErrBadServerPassword      = "BAD_SERVER_PASSWORD"
@@ -103,9 +103,9 @@ type WelcomeData struct {
 	ServerVersion string `json:"serverVersion"`
 	// UDP data plane: the client may send audio over UDP after this welcome.
 	// Empty UdpEndpoint means UDP is disabled on this server (client should
-	// fall back to WebSocket binary frames). UdpToken is opaque (HMAC) and
-	// must be presented in the first UDP packet so the server can bind the
-	// source IP:port back to this peerId.
+	// fall back to WebSocket binary frames). UdpToken is an opaque random,
+	// per-session token that must be presented in the first UDP packet so
+	// the server can bind the source IP:port back to this peerId.
 	UdpEndpoint string `json:"udpEndpoint,omitempty"` // "host:port" form
 	UdpToken    string `json:"udpToken,omitempty"`    // base64-std encoded
 }
@@ -116,11 +116,11 @@ type ErrorData struct {
 }
 
 type PeerInfo struct {
-	PeerID    string `json:"peerId"`
-	Username  string `json:"username"`
-	Role      string `json:"role"`
-	Muted     bool   `json:"muted"`
-	JoinedAt  int64  `json:"joinedAt"` // unix-ms
+	PeerID   string `json:"peerId"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	Muted    bool   `json:"muted"`
+	JoinedAt int64  `json:"joinedAt"` // unix-ms
 }
 
 type RoomJoinedData struct {

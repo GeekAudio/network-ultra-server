@@ -14,9 +14,9 @@ import (
 // senders (forwarder + control handlers) don't race on the underlying conn.
 //
 // Backpressure policy:
-//   * Control frames (text) MUST be delivered: blocking enqueue with short
+//   - Control frames (text) MUST be delivered: blocking enqueue with short
 //     timeout; on persistent failure the conn is closed (the peer is dead).
-//   * Audio frames (binary) MAY be dropped: when the queue is full we drop
+//   - Audio frames (binary) MAY be dropped: when the queue is full we drop
 //     the OLDEST queued audio frame to make room, so a slow long-RTT receiver
 //     doesn't bring the whole connection down. This is what lets sessions
 //     stay alive over 500 ms+ RTT links where TCP momentarily stalls.

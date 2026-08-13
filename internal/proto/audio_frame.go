@@ -18,9 +18,9 @@ import (
 //   total = 24 + N bytes
 
 const (
-	AudioFrameType   byte = 0xA1
-	AudioHeaderSize       = 24
-	MaxAudioPayload       = 8192
+	AudioFrameType  byte = 0xA1
+	AudioHeaderSize      = 24
+	MaxAudioPayload      = 8192
 )
 
 // AudioFrameHeader is the parsed view of the 24-byte header.
@@ -31,9 +31,9 @@ type AudioFrameHeader struct {
 }
 
 var (
-	ErrTooShort      = errors.New("audio frame: too short")
-	ErrBadType       = errors.New("audio frame: invalid type byte")
-	ErrPayloadTooBig = errors.New("audio frame: payload exceeds MaxAudioPayload")
+	ErrTooShort       = errors.New("audio frame: too short")
+	ErrBadType        = errors.New("audio frame: invalid type byte")
+	ErrPayloadTooBig  = errors.New("audio frame: payload exceeds MaxAudioPayload")
 	ErrLengthMismatch = errors.New("audio frame: declared length does not match actual size")
 )
 

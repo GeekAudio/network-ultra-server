@@ -1,186 +1,226 @@
 #!/usr/bin/env bash
-#
-# 服务端一键升级脚本 — 拉最新代码、重新编译、平滑重启 systemd 服务。
-#
-# 用法（在服务器上执行，不要在本地运行）:
-#
-#   # 推荐：jsdelivr CDN 国内能直连
-#   curl -fsSL https://cdn.jsdelivr.net/gh/GeekASMR/network-ultra-server@main/scripts/update-server.sh | sudo bash
-#
-#   # 备用：ghproxy 镜像
-#   curl -fsSL https://ghproxy.com/https://raw.githubusercontent.com/GeekASMR/network-ultra-server/main/scripts/update-server.sh | sudo bash
-#
-#   # 直连（仅在你能直接访问 github 时）
-#   curl -fsSL https://raw.githubusercontent.com/GeekASMR/network-ultra-server/main/scripts/update-server.sh | sudo bash
-#
-# 前提：
-#   * 服务器已经通过 install-from-source.sh 完成首次安装
-#   * /opt/network-ultra-src 是 git 仓库（首次安装会创建）
-#   * /etc/systemd/system/network-ultra-server.service 已注册
-#
-# 这个脚本只做"升级"，不重新写配置文件、不改防火墙、不重置 admin token。
-
+# Update to an exact source commit and roll back automatically on failure.
 set -euo pipefail
 
-# 切到稳定 cwd 防止脚本运行中目录被 git 操作影响
-cd /tmp
-
-SRC_DIR="/opt/network-ultra-src"
-BIN_PATH="/usr/local/bin/network-ultra-server"
+TEST_ROOT="${NU_UPDATE_TEST_ROOT:-}"
+if [[ -n "$TEST_ROOT" ]]; then
+  [[ "$EUID" -ne 0 ]] || {
+    printf 'error: fixture mode is forbidden for root\n' >&2
+    exit 1
+  }
+  [[ "$TEST_ROOT" =~ ^/tmp/network-ultra-update-fixture\.[A-Za-z0-9]+$ ]] || {
+    printf 'error: NU_UPDATE_TEST_ROOT is reserved for the isolated fixture\n' >&2
+    exit 1
+  }
+  SRC_DIR="$TEST_ROOT/opt/network-ultra-src"
+  BIN_PATH="$TEST_ROOT/usr/local/bin/network-ultra-server"
+  CFG_FILE="$TEST_ROOT/etc/network-ultra/config.toml"
+  SVC_FILE="$TEST_ROOT/etc/systemd/system/network-ultra-server.service"
+  REPO_URL="${NU_UPDATE_TEST_REPO:?NU_UPDATE_TEST_REPO is required in fixture mode}"
+  FETCH_PROTOCOL_POLICY=always
+else
+  SRC_DIR="/opt/network-ultra-src"
+  BIN_PATH="/usr/local/bin/network-ultra-server"
+  CFG_FILE="/etc/network-ultra/config.toml"
+  SVC_FILE="/etc/systemd/system/network-ultra-server.service"
+  REPO_URL="https://github.com/GeekASMR/network-ultra-server.git"
+  FETCH_PROTOCOL_POLICY=never
+fi
 SVC_NAME="network-ultra-server"
-GO_PATH="/usr/local/go/bin/go"
 
-c_red() { printf '\033[31m%s\033[0m\n' "$*"; }
-c_grn() { printf '\033[32m%s\033[0m\n' "$*"; }
-c_blu() { printf '\033[36m%s\033[0m\n' "$*"; }
-step()  { c_blu "[$1] $2"; }
-
-if [[ "${EUID}" -ne 0 ]]; then
-  c_red "请用 root 权限执行（加 sudo）。"; exit 1
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+if [[ -z "$TEST_ROOT" ]]; then
+  [[ "$(uname -s)" == Linux ]] || die "Linux is required"
+  [[ "$EUID" -eq 0 ]] || die "run with sudo/root"
+  [[ -d /run/systemd/system ]] || die "systemd is required"
 fi
 
-if [[ ! -d "$SRC_DIR/.git" ]]; then
-  c_red "找不到 $SRC_DIR/.git — 这台服务器看起来还没装过。请先跑 install-from-source.sh。"
-  exit 1
+# Serialize the entire update before reading installed state or creating a
+# stage. Production uses a fixed lock under root-only /run; fixture mode uses
+# the same open-file-description locking semantics through Perl because Git
+# for Windows does not ship util-linux flock(1).
+if [[ -n "$TEST_ROOT" ]]; then
+  LOCK_DIR="$TEST_ROOT/run/network-ultra-server-update"
+  mkdir -p -- "$LOCK_DIR"
+  LOCK_FILE="$LOCK_DIR/update.lock"
+  : >>"$LOCK_FILE"
+  exec 9<>"$LOCK_FILE"
+  command -v perl >/dev/null || die "Perl is required for the update fixture lock"
+  perl -e 'flock(STDIN, 6) or exit 1' <&9 || die "another server operation is already running"
+else
+  LOCK_DIR="/run/network-ultra-server-update"
+  if [[ -L "$LOCK_DIR" || ( -e "$LOCK_DIR" && ! -d "$LOCK_DIR" ) ]]; then
+    die "$LOCK_DIR must be a real directory"
+  fi
+  if [[ ! -e "$LOCK_DIR" ]]; then
+    install -d -o root -g root -m 0700 "$LOCK_DIR"
+  fi
+  [[ "$(stat -c '%u:%g:%a' "$LOCK_DIR")" == "0:0:700" ]] || die "$LOCK_DIR must be root:root mode 0700"
+  LOCK_FILE="$LOCK_DIR/update.lock"
+  if [[ -L "$LOCK_FILE" || ( -e "$LOCK_FILE" && ! -f "$LOCK_FILE" ) ]]; then
+    die "$LOCK_FILE must be a regular file"
+  fi
+  if [[ ! -e "$LOCK_FILE" ]]; then
+    # noclobber maps to an exclusive create: two first-ever invocations cannot
+    # replace the pathname with different inodes and accidentally lock each one.
+    ( umask 077; set -o noclobber; : >"$LOCK_FILE" ) 2>/dev/null || true
+  fi
+  [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] || die "$LOCK_FILE creation failed"
+  [[ "$(stat -c '%u:%g:%a' "$LOCK_FILE")" == "0:0:600" ]] || die "$LOCK_FILE must be root:root mode 0600"
+  exec 9<>"$LOCK_FILE"
+  command -v flock >/dev/null || die "util-linux flock is required"
+  flock -n 9 || die "another server operation is already running"
 fi
 
-if [[ ! -x "$GO_PATH" ]] && ! command -v go >/dev/null 2>&1; then
-  c_red "找不到 go 编译器。请先跑 install-from-source.sh 装好 Go。"
-  exit 1
+if [[ -n "$TEST_ROOT" && -n "${NU_UPDATE_TEST_HOLD_AFTER_LOCK:-}" ]]; then
+  : >"${NU_UPDATE_TEST_HOLD_AFTER_LOCK}.ready"
+  while [[ ! -e "${NU_UPDATE_TEST_HOLD_AFTER_LOCK}.release" ]]; do
+    /usr/bin/sleep 0.05
+  done
 fi
-[[ -x "$GO_PATH" ]] || GO_PATH="$(command -v go)"
 
-step "1/5" "拉取最新代码"
-cd "$SRC_DIR"
-# fetch+reset 而不是 pull：避免本地修改（如果有的话）阻塞升级
-#
-# 国内网络 fetch github.com 经常超时，依次尝试镜像直到拿到代码：
-#   1. 直连 GitHub（有时能通，有就直接用）
-#   2. ghproxy.com 全代理
-#   3. ghproxy.net（备选）
-#   4. gitclone.com 镜像
-#   5. hub.gitmirror.com
-# 每个尝试 25 秒超时，避免一个挂了就僵住整个升级。
-fetch_with_url() {
-  local url="$1"
-  echo "  尝试 $url"
-  git remote set-url origin "$url"
-  timeout 25 git fetch --tags origin 2>&1
+[[ -d "$SRC_DIR/.git" ]] || die "$SRC_DIR is not a git checkout"
+if [[ -n "$TEST_ROOT" ]]; then
+  [[ -f "$BIN_PATH" ]] || die "$BIN_PATH is not an installed file"
+else
+  [[ -x "$BIN_PATH" ]] || die "$BIN_PATH is not an installed executable"
+fi
+command -v go >/dev/null || die "Go is required"
+command -v git >/dev/null || die "git is required"
+command -v curl >/dev/null || die "curl is required for health checks"
+command -v systemctl >/dev/null || die "systemctl is required"
+[[ -z "$(git -C "$SRC_DIR" status --porcelain)" ]] || die "$SRC_DIR has local changes; refusing to overwrite them"
+SOURCE_COMMIT="${NU_SOURCE_COMMIT:-}"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "NU_SOURCE_COMMIT must be an audited lowercase 40-character commit SHA"
+RELEASE_VERSION="${NU_RELEASE_VERSION:-$SOURCE_COMMIT}"
+[[ "$RELEASE_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$ ]] || die "NU_RELEASE_VERSION contains unsafe characters"
+
+OLD_REV=$(git -C "$SRC_DIR" rev-parse HEAD)
+SRC_PARENT=$(dirname -- "$SRC_DIR")
+STAGE=$(mktemp -d "$SRC_PARENT/.network-ultra-update.XXXXXX")
+NEW_SRC="$STAGE/src"
+OLD_SRC="${SRC_DIR}.rollback.$$"
+BACKUP="$STAGE/network-ultra-server.rollback"
+NEW_BIN="${BIN_PATH}.new.$$"
+HAD_OLD_SERVICE=0
+MUTATED=0
+SUCCESS=0
+WAS_ACTIVE=0
+WAS_ENABLED=0
+if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then WAS_ACTIVE=1; fi
+if systemctl is-enabled --quiet "$SVC_NAME" 2>/dev/null; then WAS_ENABLED=1; fi
+rollback_update() {
+  local status=$?
+  trap - EXIT INT TERM
+  set +e
+  if [[ "$SUCCESS" -ne 1 && "$MUTATED" -eq 1 ]]; then
+    systemctl stop "$SVC_NAME" >/dev/null 2>&1 || true
+    if [[ -f "$BACKUP" ]]; then install -m 0755 "$BACKUP" "$BIN_PATH" || true; fi
+    if [[ "$HAD_OLD_SERVICE" -eq 1 ]]; then
+      install -m 0644 "$STAGE/old.service" "$SVC_FILE" || true
+    else
+      rm -f -- "$SVC_FILE"
+    fi
+    if [[ -e "$OLD_SRC" ]]; then
+      if [[ -e "$SRC_DIR" ]]; then rm -rf -- "$SRC_DIR"; fi
+      mv -- "$OLD_SRC" "$SRC_DIR" || true
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "$WAS_ENABLED" -eq 1 ]]; then
+      systemctl enable "$SVC_NAME" >/dev/null 2>&1 || true
+    else
+      systemctl disable "$SVC_NAME" >/dev/null 2>&1 || true
+    fi
+    if [[ "$WAS_ACTIVE" -eq 1 ]]; then
+      systemctl start "$SVC_NAME" >/dev/null 2>&1 || true
+    else
+      systemctl stop "$SVC_NAME" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f -- "$NEW_BIN"
+  rm -rf -- "$STAGE"
+  exit "$status"
 }
+trap rollback_update EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-ORIG_URL=$(git remote get-url origin)
-FETCH_OK=0
-for url in \
-  "https://github.com/GeekASMR/network-ultra-server" \
-  "https://ghproxy.com/https://github.com/GeekASMR/network-ultra-server" \
-  "https://ghproxy.net/https://github.com/GeekASMR/network-ultra-server" \
-  "https://gitclone.com/github.com/GeekASMR/network-ultra-server" \
-  "https://hub.gitmirror.com/https://github.com/GeekASMR/network-ultra-server"
-do
-  if fetch_with_url "$url"; then
-    FETCH_OK=1
-    break
-  fi
-  echo "    （超时/失败，下一个）"
-done
-# 还原 origin url，避免镜像写死
-git remote set-url origin "$ORIG_URL"
+# Fetch, verify, test, and build without touching the installed checkout. The
+# staging directory shares SRC_DIR's filesystem so the later source swap is a
+# pair of same-volume renames.
+install -d -m 0755 "$NEW_SRC"
+git -C "$NEW_SRC" init
+git -C "$NEW_SRC" remote add origin "$REPO_URL"
+git -c "protocol.file.allow=$FETCH_PROTOCOL_POLICY" -C "$NEW_SRC" fetch --depth 1 origin "$SOURCE_COMMIT"
+git -C "$NEW_SRC" checkout --detach FETCH_HEAD
+[[ "$(git -C "$NEW_SRC" rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || die "source commit verification failed"
+[[ -f "$NEW_SRC/systemd/network-ultra-server.service" ]] || die "pinned source is missing the systemd service unit"
 
-if [[ "$FETCH_OK" -ne 1 ]]; then
-  c_red "所有镜像都拉不下来。请手动检查网络或临时关闭 GFW 代理后重跑。"
-  exit 1
-fi
-
-OLD_REV=$(git rev-parse --short HEAD || echo "unknown")
-git reset --hard FETCH_HEAD
-NEW_REV=$(git rev-parse --short HEAD)
-echo "  $OLD_REV → $NEW_REV"
-
-if [[ "$OLD_REV" == "$NEW_REV" ]]; then
-  echo "  代码已是最新，无需升级。"
-  echo "  （如果你想强制重新编译并重启，可以先 systemctl restart $SVC_NAME）"
-  exit 0
-fi
-
-step "2/5" "编译"
-export GOPROXY="${GOPROXY:-https://goproxy.cn,https://proxy.golang.org,direct}"
-export GOSUMDB="${GOSUMDB:-off}"
+export GOPROXY="https://proxy.golang.org,direct"
+export GOSUMDB="sum.golang.org"
 export CGO_ENABLED=0
+cd "$NEW_SRC"
+go mod download
+go mod verify
+go test ./...
+go build -trimpath -ldflags="-s -w -X main.buildVersion=$RELEASE_VERSION" -o "$STAGE/network-ultra-server.new" ./cmd/server
+[[ "$("$STAGE/network-ultra-server.new" -version)" == "network-ultra-server $RELEASE_VERSION" ]] || die "built version verification failed"
+HEALTH_URL=$("$STAGE/network-ultra-server.new" -config "$CFG_FILE" -print-health-url) || die "new config has no valid loopback health URL"
+validate_health_url() {
+  local url=$1 port
+  if [[ "$url" =~ ^http://127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:([1-9][0-9]{0,4})/healthz$ ]]; then
+    port=${BASH_REMATCH[1]}
+  elif [[ "$url" =~ ^http://\[::1\]:([1-9][0-9]{0,4})/healthz$ ]]; then
+    port=${BASH_REMATCH[1]}
+  else
+    return 1
+  fi
+  (( port >= 1 && port <= 65535 ))
+}
+validate_health_url "$HEALTH_URL" || die "new config health URL is not a strict loopback HTTP endpoint"
 
-# 临时输出到 .new，编译成功才替换正在跑的二进制，避免 crash 半成品
-TMP_BIN="${BIN_PATH}.new"
-"$GO_PATH" build -trimpath \
-  -ldflags="-s -w -X main.buildVersion=$NEW_REV" \
-  -o "$TMP_BIN" ./cmd/server
-echo "  编译完成: $(ls -lh $TMP_BIN | awk '{print $5}')"
-
-step "3/5" "停止旧服务"
+[[ ! -e "$OLD_SRC" ]] || die "rollback path already exists: $OLD_SRC"
+[[ ! -e "$NEW_BIN" ]] || die "staged binary path already exists: $NEW_BIN"
+cp --preserve=mode,ownership,timestamps "$BIN_PATH" "$BACKUP"
+if [[ -f "$SVC_FILE" ]]; then
+  cp --preserve=mode,ownership,timestamps "$SVC_FILE" "$STAGE/old.service"
+  HAD_OLD_SERVICE=1
+fi
+install -m 0755 "$STAGE/network-ultra-server.new" "$NEW_BIN"
+MUTATED=1
 systemctl stop "$SVC_NAME"
+mv -- "$SRC_DIR" "$OLD_SRC"
+mv -- "$NEW_SRC" "$SRC_DIR"
+mv -- "$NEW_BIN" "$BIN_PATH"
+install -m 0644 "$SRC_DIR/systemd/network-ultra-server.service" "$SVC_FILE"
+systemctl daemon-reload
+if [[ "$WAS_ENABLED" -eq 1 ]]; then
+  systemctl enable "$SVC_NAME" >/dev/null
+else
+  systemctl disable "$SVC_NAME" >/dev/null
+fi
+if [[ "$WAS_ACTIVE" -eq 1 ]]; then
+  systemctl start "$SVC_NAME" || die "new service failed to start; rollback requested"
 
-step "4/5" "替换二进制"
-mv -f "$TMP_BIN" "$BIN_PATH"
-chmod +x "$BIN_PATH"
-
-step "5/5" "启动新服务并健康检查"
-# UDP 数据面新增 18902 端口（v1.2+）。如果 iptables 默认 DROP，需要打开。
-# 用 iptables 而不是 ufw 因为腾讯云轻量很多模板没装 ufw，iptables 一定有。
-# 同步开 INPUT 和 OUTPUT，规则去重避免重复 append。
-if command -v iptables >/dev/null 2>&1; then
-  if ! iptables -C INPUT -p udp --dport 18902 -j ACCEPT 2>/dev/null; then
-    iptables -A INPUT -p udp --dport 18902 -j ACCEPT || true
-    echo "  已开放 UDP 18902（INPUT）"
-  fi
-  if ! iptables -C OUTPUT -p udp --sport 18902 -j ACCEPT 2>/dev/null; then
-    iptables -A OUTPUT -p udp --sport 18902 -j ACCEPT || true
-    echo "  已开放 UDP 18902（OUTPUT）"
+  HEALTH_OK=0
+  for _ in {1..10}; do
+    HEALTH_BODY=$(curl --proto '=http' --globoff --noproxy '*' --connect-timeout 1 --max-time 2 -fsS "$HEALTH_URL" 2>/dev/null || true)
+    if systemctl is-active --quiet "$SVC_NAME" \
+      && [[ "$HEALTH_BODY" == *'"status":"ok"'* ]] \
+      && [[ "$HEALTH_BODY" == *"\"version\":\"$RELEASE_VERSION\""* ]]; then
+      HEALTH_OK=1
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$HEALTH_OK" -ne 1 ]]; then
+    die "health check failed; rollback requested"
   fi
 fi
-
-# 不再需要写 udp_advertise_host：v1.2 服务端会根据客户端连进来的 HTTP Host
-# 自动推导 UDP endpoint（这样云服务器不用关心自己的公网 IP，client 用什么
-# 地址连进来就用什么地址回应）。如果之前的版本写了一个错的 udp_advertise_host
-# （比如内网 IP），把它清掉以免覆盖自动推导。
-CONF=/etc/network-ultra/config.toml
-if [[ -f "$CONF" ]] && grep -q '^udp_advertise_host' "$CONF"; then
-  HOST_VAL=$(grep '^udp_advertise_host' "$CONF" | head -1 | awk -F'"' '{print $2}')
-  # 如果是 10.x / 172.16-31.x / 192.168.x 内网 IP，直接清掉
-  if [[ "$HOST_VAL" =~ ^10\. ]] || [[ "$HOST_VAL" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] || [[ "$HOST_VAL" =~ ^192\.168\. ]]; then
-    sed -i '/^udp_advertise_host/d' "$CONF"
-    echo "  config.toml 删除内网 IP 的 udp_advertise_host = \"$HOST_VAL\"（v1.2 自动推导）"
-  fi
+SUCCESS=1
+rm -rf -- "$OLD_SRC"
+if [[ "$WAS_ACTIVE" -eq 1 ]]; then
+  printf 'updated %s -> %s with verified health check\n' "$OLD_REV" "$SOURCE_COMMIT"
+else
+  printf 'updated inactive service %s -> %s; service remained stopped\n' "$OLD_REV" "$SOURCE_COMMIT"
 fi
-
-systemctl start "$SVC_NAME"
-
-# 给服务 3 秒钟起来
-HEALTH_OK=0
-for i in 1 2 3 4 5 6 7 8 9 10; do
-  sleep 1
-  if curl -fs http://127.0.0.1:18901/healthz > /dev/null 2>&1; then
-    HEALTH_OK=1; break
-  fi
-done
-
-if [[ "$HEALTH_OK" -ne 1 ]]; then
-  c_red "健康检查失败！服务可能没起来，请查看日志:"
-  c_red "  journalctl -u $SVC_NAME -n 50 --no-pager"
-  exit 1
-fi
-
-cat <<EOF
-
-═════════════════════════════════════════════════════════════
-$(c_grn "  ✓ Network Ultra Server 升级完成")
-═════════════════════════════════════════════════════════════
-
-  版本:  $OLD_REV → $NEW_REV
-  状态:  $(systemctl is-active $SVC_NAME)
-  端点:  ws://$(hostname -I | awk '{print $1}'):18900
-  UDP :  $(hostname -I | awk '{print $1}'):18902 (新音频通道, 自动 fallback 到 ws)
-
-  实时日志:
-    journalctl -u $SVC_NAME -f
-
-  健康状态:
-    curl http://127.0.0.1:18901/healthz
-EOF

@@ -1,10 +1,13 @@
 [Unit]
 Description=Network Ultra Audio Server
 Documentation=https://github.com/GeekASMR/network-ultra-server
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
+User=network-ultra
+Group=network-ultra
 ExecStart=/usr/local/bin/network-ultra-server -config /etc/network-ultra/config.toml
 Restart=on-failure
 RestartSec=5
@@ -13,7 +16,14 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/network-ultra
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadOnlyPaths=/etc/network-ultra
 StateDirectory=network-ultra
 StateDirectoryMode=0700

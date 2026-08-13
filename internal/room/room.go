@@ -7,6 +7,8 @@ import (
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/GeekASMR/network-ultra-server/internal/proto"
 )
 
 const (
@@ -16,10 +18,10 @@ const (
 )
 
 var (
-	ErrRoomFull       = errors.New("room full")
-	ErrBadPassword    = errors.New("bad password")
-	ErrAlreadyInRoom  = errors.New("peer already in a room")
-	ErrPeerNotInRoom  = errors.New("peer not in this room")
+	ErrRoomFull      = errors.New("room full")
+	ErrBadPassword   = errors.New("bad password")
+	ErrAlreadyInRoom = errors.New("peer already in a room")
+	ErrPeerNotInRoom = errors.New("peer not in this room")
 )
 
 // Frame is a fully-packed audio frame (header + payload). It is reference-
@@ -52,7 +54,9 @@ type Room struct {
 	wg      sync.WaitGroup
 
 	// destroy timer / disposable flags managed by Registry.
-	destroyTimer *time.Timer
+	destroyTimer      *time.Timer
+	destroyGeneration uint64
+	destroyed         bool
 
 	// Registry back-reference for housekeeping (set by Registry.Create).
 	registry *Registry
@@ -96,6 +100,9 @@ func (r *Room) CheckPassword(plain string) error {
 	if !r.HasPassword {
 		return nil
 	}
+	if len([]byte(plain)) > proto.MaxPasswordBytes {
+		return ErrBadPassword
+	}
 	if err := bcrypt.CompareHashAndPassword(r.passwordHash, []byte(plain)); err != nil {
 		return ErrBadPassword
 	}
@@ -105,17 +112,39 @@ func (r *Room) CheckPassword(plain string) error {
 // Add attempts to add a peer to the room. Returns the peer snapshot list
 // (excluding the new peer) for the room_joined response.
 func (r *Room) Add(p *Peer) ([]PeerSnapshot, error) {
+	// Registry membership and room mutation are one transaction. Holding the
+	// registry read lock prevents destroy from unpublishing this room between a
+	// successful Add and its emptiness recheck, while preserving the global
+	// registry->room lock order used by destroy and CountPeers.
+	reg := r.registry
+	if reg != nil {
+		reg.mu.RLock()
+		if reg.rooms[r.NameLower] != r {
+			reg.mu.RUnlock()
+			return nil, ErrRoomNotFound
+		}
+	}
 	r.mu.Lock()
+	if r.destroyed {
+		r.mu.Unlock()
+		if reg != nil {
+			reg.mu.RUnlock()
+		}
+		return nil, ErrRoomNotFound
+	}
 	if len(r.peers) >= r.MaxPeers {
 		r.mu.Unlock()
+		if reg != nil {
+			reg.mu.RUnlock()
+		}
 		return nil, ErrRoomFull
 	}
 	r.peers[p.ID] = p
 	if r.destroyTimer != nil {
 		r.destroyTimer.Stop()
 		r.destroyTimer = nil
+		r.destroyGeneration++
 	}
-
 	others := make([]PeerSnapshot, 0, len(r.peers)-1)
 	for _, q := range r.peers {
 		if q.ID == p.ID {
@@ -130,6 +159,9 @@ func (r *Room) Add(p *Peer) ([]PeerSnapshot, error) {
 		})
 	}
 	r.mu.Unlock()
+	if reg != nil {
+		reg.mu.RUnlock()
+	}
 
 	p.setRoom(r)
 	return others, nil
@@ -157,13 +189,22 @@ func (r *Room) Remove(peerID uuid.UUID) {
 // scheduleEmptyDestroy starts a timer to remove the room from the registry
 // roomEmptyDestroyDur after going empty. Caller holds no lock.
 func (r *Room) scheduleEmptyDestroy() {
+	r.scheduleDestroyIfEmpty(roomEmptyDestroyDur)
+}
+
+// scheduleDestroyIfEmpty installs exactly one identified timer. It rechecks
+// emptiness while holding the room lock so an Add between Remove and this call
+// cannot arm a timer for an active room.
+func (r *Room) scheduleDestroyIfEmpty(delay time.Duration) {
 	r.mu.Lock()
-	if r.destroyTimer != nil {
+	if r.registry == nil || r.destroyed || len(r.peers) != 0 || r.destroyTimer != nil {
 		r.mu.Unlock()
 		return
 	}
-	r.destroyTimer = time.AfterFunc(roomEmptyDestroyDur, func() {
-		r.registry.destroy(r)
+	r.destroyGeneration++
+	generation := r.destroyGeneration
+	r.destroyTimer = time.AfterFunc(delay, func() {
+		r.registry.destroy(r, generation)
 	})
 	r.mu.Unlock()
 }
@@ -220,6 +261,16 @@ func (r *Room) forwardLoop() {
 
 func (r *Room) fanOut(f *Frame) {
 	r.mu.RLock()
+	// Recheck source mute state at fan-out time. The transport ingress paths
+	// reject muted audio too, but this closes the queueing race where a frame
+	// was accepted immediately before a peer_mute command took effect.
+	if source := r.peers[f.SourcePeerID]; source == nil || source.Muted() {
+		r.mu.RUnlock()
+		if f.Done != nil {
+			f.Done()
+		}
+		return
+	}
 	peers := make([]*Peer, 0, len(r.peers))
 	for _, p := range r.peers {
 		if p.ID == f.SourcePeerID {
@@ -248,32 +299,31 @@ func (r *Room) fanOut(f *Frame) {
 // idleDestroyAfterCreate fires roomIdleNoJoinDur after creation if no peer
 // ever joined. Used to clean ghost rooms (creator crashes during join).
 func (r *Room) startIdleDestroyTimer() {
-	time.AfterFunc(roomIdleNoJoinDur, func() {
-		r.mu.RLock()
-		empty := len(r.peers) == 0
-		r.mu.RUnlock()
-		if empty && r.registry != nil {
-			r.registry.destroy(r)
-		}
-	})
+	r.scheduleDestroyIfEmpty(roomIdleNoJoinDur)
 }
 
-// hashPassword turns a plaintext password into its bcrypt hash. Empty input
+// HashPassword turns a plaintext password into its bcrypt hash. Empty input
 // returns nil (no password).
-func hashPassword(plain string) ([]byte, error) {
+func HashPassword(plain string) ([]byte, error) {
 	if plain == "" {
 		return nil, nil
+	}
+	if len([]byte(plain)) > proto.MaxPasswordBytes {
+		return nil, bcrypt.ErrPasswordTooLong
 	}
 	return bcrypt.GenerateFromPassword([]byte(plain), bcrypt.DefaultCost)
 }
 
-
-// ForEachPeer invokes fn for every peer in the room. fn is called while the
-// read lock is held; do not block in fn.
+// ForEachPeer invokes fn for a point-in-time peer snapshot. Network writes
+// happen outside the room lock so a slow client cannot block join/leave/mute.
 func (r *Room) ForEachPeer(fn func(*Peer)) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
+	peers := make([]*Peer, 0, len(r.peers))
 	for _, p := range r.peers {
+		peers = append(peers, p)
+	}
+	r.mu.RUnlock()
+	for _, p := range peers {
 		fn(p)
 	}
 }

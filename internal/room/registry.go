@@ -24,6 +24,11 @@ type Registry struct {
 
 	// notifySubscribers is called whenever the public room list changes.
 	notifyCb func(delta RoomListDelta)
+
+	// beforeDestroyRoomLock is a deterministic race-test hook. Production
+	// leaves it nil; tests use it to pause after registry locking but before
+	// destroy obtains room.mu.
+	beforeDestroyRoomLock func()
 }
 
 type RoomListDelta struct {
@@ -57,13 +62,15 @@ func (r *Registry) SetDeltaListener(cb func(RoomListDelta)) {
 }
 
 // Create attempts to create a room.
-func (r *Registry) Create(name, visibility, password string) (*Room, error) {
+func (r *Registry) Create(name, visibility string, passwordHash []byte) (*Room, error) {
 	if name == "" {
 		return nil, errors.New("empty name")
 	}
 	nameLower := strings.ToLower(name)
 
 	r.mu.Lock()
+	// Callers perform password hashing before entering this method. Recheck
+	// invariants only under the registry mutex to resolve concurrent creates.
 	if _, exists := r.rooms[nameLower]; exists {
 		r.mu.Unlock()
 		return nil, ErrRoomNameTaken
@@ -73,19 +80,13 @@ func (r *Registry) Create(name, visibility, password string) (*Room, error) {
 		return nil, ErrServerFull
 	}
 
-	hash, err := hashPassword(password)
-	if err != nil {
-		r.mu.Unlock()
-		return nil, err
-	}
-
 	room := &Room{
 		ID:           uuid.New(),
 		Name:         name,
 		NameLower:    nameLower,
 		Visibility:   visibility,
-		HasPassword:  hash != nil,
-		passwordHash: hash,
+		HasPassword:  passwordHash != nil,
+		passwordHash: passwordHash,
 		MaxPeers:     r.maxPeersPerRoom,
 		CreatedAt:    time.Now(),
 		peers:        make(map[uuid.UUID]*Peer),
@@ -101,7 +102,7 @@ func (r *Registry) Create(name, visibility, password string) (*Room, error) {
 	room.startIdleDestroyTimer()
 
 	if visibility == "public" && cb != nil {
-		cb(RoomListDelta{Added: []RoomListEntry{r.entryOf(room)}})
+		cb(RoomListDelta{Added: []RoomListEntry{entryOf(room)}})
 	}
 	return room, nil
 }
@@ -113,19 +114,35 @@ func (r *Registry) Find(name string) *Room {
 	return r.rooms[strings.ToLower(name)]
 }
 
-// destroy removes the room from the registry and stops its forwarder.
-// Called by Room.scheduleEmptyDestroy or idle timer.
-func (r *Registry) destroy(room *Room) {
+// destroy removes an empty room only when timer is still the room's active
+// destroy timer. Registry then room is the global lock order. Marking the room
+// destroyed under both locks makes a racing Add either win (and cancel this
+// deletion) or fail with ErrRoomNotFound; it can never join an orphaned room
+// whose forwarder is being closed.
+func (r *Registry) destroy(room *Room, generation uint64) {
 	r.mu.Lock()
-	if existing, ok := r.rooms[room.NameLower]; ok && existing == room {
-		delete(r.rooms, room.NameLower)
-	} else {
+	existing, ok := r.rooms[room.NameLower]
+	if !ok || existing != room {
 		r.mu.Unlock()
 		return
 	}
+	if r.beforeDestroyRoomLock != nil {
+		r.beforeDestroyRoomLock()
+	}
+	room.mu.Lock()
+	if room.destroyed || room.destroyTimer == nil || room.destroyGeneration != generation || len(room.peers) != 0 {
+		room.mu.Unlock()
+		r.mu.Unlock()
+		return
+	}
+	room.destroyed = true
+	room.destroyTimer = nil
+	room.destroyGeneration++
+	delete(r.rooms, room.NameLower)
 	cb := r.notifyCb
 	visibility := room.Visibility
 	name := room.Name
+	room.mu.Unlock()
 	r.mu.Unlock()
 
 	room.close()
@@ -138,18 +155,23 @@ func (r *Registry) destroy(room *Room) {
 // PublicList returns a snapshot of all public rooms for room_list_result.
 func (r *Registry) PublicList() []RoomListEntry {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make([]RoomListEntry, 0)
+	rooms := make([]*Room, 0, len(r.rooms))
 	for _, rm := range r.rooms {
 		if rm.Visibility == "public" {
-			out = append(out, r.entryOf(rm))
+			rooms = append(rooms, rm)
 		}
+	}
+	r.mu.RUnlock()
+	out := make([]RoomListEntry, 0, len(rooms))
+	for _, rm := range rooms {
+		out = append(out, entryOf(rm))
 	}
 	return out
 }
 
-// entryOf builds a list entry for a room. Caller holds at least RLock.
-func (r *Registry) entryOf(rm *Room) RoomListEntry {
+// entryOf builds a list entry without holding the registry lock. It may take
+// the room lock to snapshot peer count, preserving registry→room lock order.
+func entryOf(rm *Room) RoomListEntry {
 	return RoomListEntry{
 		RoomName:    rm.Name,
 		PeerCount:   rm.PeerCount(),
@@ -165,10 +187,9 @@ func (r *Registry) PublishUpdate(rm *Room) {
 	r.mu.RLock()
 	cb := r.notifyCb
 	pub := rm.Visibility == "public"
-	entry := r.entryOf(rm)
 	r.mu.RUnlock()
 	if pub && cb != nil {
-		cb(RoomListDelta{Updated: []RoomListEntry{entry}})
+		cb(RoomListDelta{Updated: []RoomListEntry{entryOf(rm)}})
 	}
 }
 

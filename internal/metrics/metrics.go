@@ -15,17 +15,17 @@ type counter struct {
 	v atomic.Uint64
 }
 
-func (c *counter) Inc()         { c.v.Add(1) }
-func (c *counter) Add(n uint64) { c.v.Add(n) }
+func (c *counter) Inc()          { c.v.Add(1) }
+func (c *counter) Add(n uint64)  { c.v.Add(n) }
 func (c *counter) Value() uint64 { return c.v.Load() }
 
 type gauge struct {
 	v atomic.Int64
 }
 
-func (g *gauge) Set(n int64) { g.v.Store(n) }
-func (g *gauge) Inc()        { g.v.Add(1) }
-func (g *gauge) Dec()        { g.v.Add(-1) }
+func (g *gauge) Set(n int64)  { g.v.Store(n) }
+func (g *gauge) Inc()         { g.v.Add(1) }
+func (g *gauge) Dec()         { g.v.Add(-1) }
 func (g *gauge) Value() int64 { return g.v.Load() }
 
 // Registry holds named counters and gauges + label families.

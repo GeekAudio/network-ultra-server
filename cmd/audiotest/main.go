@@ -3,14 +3,15 @@
 // Ultra Server.
 //
 // Usage:
-//   go run ./cmd/audiotest -server ws://146.56.202.138:18900 -room audiotest -frames 100
+//
+//	go run ./cmd/audiotest -server ws://146.56.202.138:18900 -room audiotest -frames 100
 //
 // Flow:
-//   1. Receiver joins room first, role=recv
-//   2. Sender joins same room, role=send
-//   3. Sender pushes N synthesised audio frames (sine wave, well-formed PCM payload)
-//   4. Receiver collects every binary frame the server forwards
-//   5. Compare seq + payload byte-for-byte; report drops/reorders/loss
+//  1. Receiver joins room first, role=recv
+//  2. Sender joins same room, role=send
+//  3. Sender pushes N synthesised audio frames (sine wave, well-formed PCM payload)
+//  4. Receiver collects every binary frame the server forwards
+//  5. Compare seq + payload byte-for-byte; report drops/reorders/loss
 package main
 
 import (

@@ -22,7 +22,7 @@ body:
     attributes:
       label: 服务器版本
       description: 自建服务器或第三方服务器的版本号 / commit。
-      placeholder: "v1.3.0 / 用的是 ws://example.com:18900 第三方"
+      placeholder: "v1.3.0 / 用的是 wss://example.com 第三方"
     validations:
       required: true
   - type: input

@@ -1,378 +1,324 @@
 #!/usr/bin/env bash
-# Network Ultra Server 一键自建脚本(从源码编译)
-# 用法:
-#   curl -fsSL https://raw.githubusercontent.com/GeekASMR/network-ultra-server/main/scripts/install-from-source.sh | sudo bash
+# Build and install an exact, operator-selected source commit.
 set -euo pipefail
-
-# Pin cwd to /tmp so later `rm -rf $SRC_DIR` doesn't yank the shell's cwd out
-# from under us. (Happens when the user happens to be sitting in
-# /opt/network-ultra-src when re-running the installer — `git clone` then
-# fatals with "Unable to read current working directory".)
-cd /tmp
 
 REPO_URL="https://github.com/GeekASMR/network-ultra-server.git"
 SRC_DIR="/opt/network-ultra-src"
 BIN_PATH="/usr/local/bin/network-ultra-server"
 CFG_DIR="/etc/network-ultra"
-CFG_FILE="${CFG_DIR}/config.toml"
+CFG_FILE="$CFG_DIR/config.toml"
 SVC_FILE="/etc/systemd/system/network-ultra-server.service"
-GO_VERSION="1.22.5"
+SERVICE_USER="network-ultra"
+STATE_DIR="/var/lib/network-ultra"
 
-c_red()   { printf '\033[31m%s\033[0m\n' "$*"; }
-c_grn()   { printf '\033[32m%s\033[0m\n' "$*"; }
-c_blu()   { printf '\033[36m%s\033[0m\n' "$*"; }
-step()    { c_blu "[$1] $2"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-# 0. 前置检查
-if [[ "$(uname -s)" != "Linux" ]]; then
-  c_red "本脚本仅支持 Linux,当前系统:$(uname -s)"; exit 1
-fi
-if [[ "${EUID}" -ne 0 ]]; then
-  c_red "请用 root 权限执行(加 sudo)。"; exit 1
-fi
-if [[ ! -d /run/systemd/system ]]; then
-  c_red "需要 systemd(/run/systemd/system 不存在)。"; exit 1
-fi
-
-step "1/7" "检测系统架构"
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64)  GOARCH=amd64 ;;
-  aarch64) GOARCH=arm64 ;;
-  *) c_red "不支持的 CPU 架构:$ARCH"; exit 1 ;;
-esac
-echo "  架构 = $ARCH (Go 架构 = $GOARCH)"
-
-if ss -tlnp 2>/dev/null | grep -qE ':18900\b'; then
-  # If our own systemd service is the one holding the port, gracefully stop
-  # it so the rest of the installer can re-deploy. Anything else (different
-  # service or container squatting on 18900) is a real conflict and bails.
-  if systemctl is-active --quiet network-ultra-server 2>/dev/null \
-       && ss -tlnp 2>/dev/null | grep -E ':18900\b' | grep -q 'network-ultra-s'; then
-    echo "  端口 18900 被旧版 network-ultra-server 占用,先停止以便升级..."
-    systemctl stop network-ultra-server || true
-    sleep 1
-  else
-    c_red "端口 18900 已被其它服务占用,请先停掉冲突服务。"; exit 1
+restore_source_tree() {
+  local live=$1 old=$2 staged=$3 original_present=$4 moved=$5
+  if [[ -e "$old" ]]; then
+    if [[ -e "$live" ]]; then rm -rf -- "$live"; fi
+    mv -- "$old" "$live" || true
+  elif [[ "$original_present" -eq 0 && -e "$live" \
+    && ( "$moved" -eq 1 || ! -e "$staged" ) ]]; then
+    rm -rf -- "$live"
   fi
-fi
-
-step "2/7" "确认 Go >= ${GO_VERSION}"
-need_go=1
-if command -v go >/dev/null 2>&1; then
-  cur=$(go version | awk '{print $3}' | sed 's/^go//')
-  major=$(echo "$cur" | cut -d. -f1)
-  minor=$(echo "$cur" | cut -d. -f2)
-  if [[ "$major" -ge 1 && "$minor" -ge 22 ]]; then
-    need_go=0
-    echo "  已安装 Go $cur"
-  else
-    echo "  已安装 Go $cur,版本太旧"
-  fi
-fi
-if [[ "$need_go" -eq 1 ]]; then
-  echo "  正在下载 Go ${GO_VERSION} 到 /usr/local/go(约 120 MB)..."
-  GO_TARBALL="go${GO_VERSION}.linux-${GOARCH}.tar.gz"
-  # 国内优先走 mirrors,失败回落官方
-  if ! curl -fsSL "https://mirrors.aliyun.com/golang/${GO_TARBALL}" -o "/tmp/${GO_TARBALL}" 2>/dev/null; then
-    curl -fsSL "https://go.dev/dl/${GO_TARBALL}" -o "/tmp/${GO_TARBALL}"
-  fi
-  rm -rf /usr/local/go
-  tar -C /usr/local -xzf "/tmp/${GO_TARBALL}"
-  rm -f "/tmp/${GO_TARBALL}"
-  export PATH="/usr/local/go/bin:$PATH"
-  echo "  Go 安装完成:$(/usr/local/go/bin/go version)"
-fi
-export PATH="/usr/local/go/bin:$PATH"
-
-step "3/7" "拉取源码"
-# Curated proxy list (re-tested 2026-05-23). The script tries each in order
-# until one succeeds. Direct GitHub access is tried first so users with good
-# connectivity (overseas, or with their own VPN) take the fast path.
-PROXIES=(
-  ""                                  # 空 = 直连 github.com (overseas / w/ VPN)
-  "https://gh-proxy.com/"             # 国内 ~830 ms
-  "https://ghproxy.net/"              # 国内 ~1000 ms
-  "https://ghfast.top/"               # 国内 ~1100 ms
-  "https://gh.idayer.com/"            # 国内 ~1700 ms 备胎
-)
-
-# fetch_via_proxies <github-url> <output-path-or-empty-for-stdout>
-# Tries each proxy in order until one downloads successfully (HTTP 200, body > 0).
-fetch_via_proxies() {
-  local gh_url="$1"
-  local dest="$2"
-  for prefix in "${PROXIES[@]}"; do
-    local final="${prefix}${gh_url}"
-    if [[ -n "$dest" ]]; then
-      if curl -fsSL --max-time 60 "$final" -o "$dest" 2>/dev/null; then
-        if [[ -s "$dest" ]]; then
-          [[ -n "$prefix" ]] && echo "    via 代理 $prefix" >&2
-          return 0
-        fi
-      fi
-    else
-      if curl -fsSL --max-time 60 "$final" 2>/dev/null; then
-        return 0
-      fi
-    fi
-  done
-  return 1
 }
 
-# git_clone_via_proxies <dest-dir>
-# Tries `git clone` against each proxy. Proxies for git over HTTPS work by
-# wrapping the clone URL the same way, which all 4 proxies above support.
-git_clone_via_proxies() {
-  local dest="$1"
-  for prefix in "${PROXIES[@]}"; do
-    local final="${prefix}https://github.com/GeekASMR/network-ultra-server.git"
-    if timeout 30 git clone --depth 1 "$final" "$dest" 2>/dev/null; then
-      [[ -n "$prefix" ]] && echo "    via 代理 $prefix" >&2
-      # Reset origin to canonical github.com so subsequent fetches don't pin
-      # the user to a single proxy. Future updates re-pick the fastest one.
-      ( cd "$dest" && git remote set-url origin "https://github.com/GeekASMR/network-ultra-server.git" )
-      return 0
-    fi
-  done
-  return 1
-}
+switch_source_tree() {
+  local live=$1 staged=$2 old=$3
+  PENDING_SIGNAL=0
+  trap 'PENDING_SIGNAL=130' INT
+  trap 'PENDING_SIGNAL=143' TERM
+  if [[ -e "$live" ]]; then
+    mv -- "$live" "$old"
+    HAD_OLD_SRC=1
+  fi
 
-if [[ -d "$SRC_DIR/.git" ]]; then
-  # Existing checkout. Try direct fetch first; fall back to swapping origin
-  # to a proxy when direct times out, then swap back for cleanliness.
-  if ! ( cd "$SRC_DIR" && timeout 30 git fetch --tags origin 2>/dev/null && git reset --hard origin/main ); then
-    echo "  直连 git fetch 慢/超时,改走代理..."
-    success=0
-    for prefix in "${PROXIES[@]}"; do
-      [[ -z "$prefix" ]] && continue
-      proxied="${prefix}https://github.com/GeekASMR/network-ultra-server.git"
-      if ( cd "$SRC_DIR" \
-           && git remote set-url origin "$proxied" \
-           && timeout 30 git fetch --tags origin 2>/dev/null \
-           && git reset --hard origin/main ); then
-        echo "    via 代理 $prefix"
-        success=1
-        break
-      fi
+  # Test-only blocking point for the transactional fixture. Root execution can
+  # never enter fixture mode, and production ignores the hook entirely.
+  if [[ -n "${NU_SOURCE_SWAP_TEST_ROOT:-}" && -n "${NU_SOURCE_SWAP_TEST_HOOK:-}" ]]; then
+    : >"${NU_SOURCE_SWAP_TEST_HOOK}.ready"
+    while [[ ! -e "${NU_SOURCE_SWAP_TEST_HOOK}.release" && "$PENDING_SIGNAL" -eq 0 ]]; do
+      /usr/bin/sleep 0.05
     done
-    # Always restore canonical origin so the user has a clean remote.
-    ( cd "$SRC_DIR" && git remote set-url origin "$REPO_URL" )
-    if [[ $success -ne 1 ]]; then
-      c_red "  无法从任何代理拉取最新代码;保留现有版本"
-    fi
   fi
-  echo "  已更新 $SRC_DIR 到最新版本"
-else
-  rm -rf "$SRC_DIR"
-  mkdir -p "$SRC_DIR"
-  # Try git clone first (gives us .git for future incremental updates), but
-  # fall back to a plain tar.gz when git is slow/blocked. Both paths walk
-  # the same proxy list, so behind GFW we still find a working route.
-  if git_clone_via_proxies "$SRC_DIR"; then
-    echo "  已克隆到 $SRC_DIR (git)"
+
+  mv -- "$staged" "$live"
+  SOURCE_MOVED=1
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [[ "$PENDING_SIGNAL" -ne 0 ]]; then exit "$PENDING_SIGNAL"; fi
+}
+
+# Exercise the exact source rename/rollback functions without root or any
+# system path. This mode is restricted to a freshly-created /tmp fixture and
+# is rejected under root, so it cannot bypass production preconditions.
+SOURCE_SWAP_TEST_ROOT="${NU_SOURCE_SWAP_TEST_ROOT:-}"
+if [[ -n "$SOURCE_SWAP_TEST_ROOT" ]]; then
+  [[ "$EUID" -ne 0 ]] || die "source swap fixture mode is forbidden for root"
+  [[ "$SOURCE_SWAP_TEST_ROOT" =~ ^/tmp/network-ultra-source-swap-fixture\.[A-Za-z0-9]+$ ]] \
+    || die "NU_SOURCE_SWAP_TEST_ROOT is reserved for the isolated fixture"
+  [[ -n "${NU_SOURCE_SWAP_TEST_HOOK:-}" && "$NU_SOURCE_SWAP_TEST_HOOK" == "$SOURCE_SWAP_TEST_ROOT/"* ]] \
+    || die "NU_SOURCE_SWAP_TEST_HOOK must stay inside the fixture"
+  TEST_LIVE="$SOURCE_SWAP_TEST_ROOT/opt/network-ultra-src"
+  TEST_STAGE="$SOURCE_SWAP_TEST_ROOT/opt/.network-ultra-install.test"
+  TEST_STAGED="$TEST_STAGE/src"
+  TEST_OLD="${TEST_LIVE}.rollback.test"
+  [[ -d "$TEST_LIVE" && -d "$TEST_STAGED" && ! -e "$TEST_OLD" ]] || die "source swap fixture trees are invalid"
+  ORIGINAL_SRC_PRESENT=1
+  HAD_OLD_SRC=0
+  SOURCE_MOVED=0
+  SUCCESS=0
+  rollback_source_swap_fixture() {
+    local status=$?
+    trap - EXIT INT TERM
+    if [[ "$SUCCESS" -ne 1 ]]; then
+      restore_source_tree "$TEST_LIVE" "$TEST_OLD" "$TEST_STAGED" "$ORIGINAL_SRC_PRESENT" "$SOURCE_MOVED"
+    fi
+    rm -rf -- "$TEST_STAGE"
+    exit "$status"
+  }
+  trap rollback_source_swap_fixture EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  switch_source_tree "$TEST_LIVE" "$TEST_STAGED" "$TEST_OLD"
+  SUCCESS=1
+  rm -rf -- "$TEST_OLD"
+  printf 'SOURCE_SWAP_FIXTURE_OK\n'
+  exit 0
+fi
+
+[[ "$(uname -s)" == Linux ]] || die "Linux is required"
+[[ "$EUID" -eq 0 ]] || die "run with sudo/root"
+[[ -d /run/systemd/system ]] || die "systemd is required"
+command -v git >/dev/null || die "git is required"
+command -v go >/dev/null || die "Go 1.22 or newer is required (install from your OS vendor)"
+command -v openssl >/dev/null || die "openssl is required for secure credentials"
+command -v curl >/dev/null || die "curl is required for health checks"
+command -v systemctl >/dev/null || die "systemctl is required"
+command -v useradd >/dev/null || die "useradd is required"
+command -v userdel >/dev/null || die "userdel is required for rollback"
+command -v install >/dev/null || die "install is required"
+command -v stat >/dev/null || die "stat is required"
+command -v flock >/dev/null || die "util-linux flock is required"
+
+# Serialize source installs, release installs, updates, and password changes on
+# one fixed, root-owned descriptor before reading installed state or staging.
+LOCK_DIR="/run/network-ultra-server-update"
+if [[ -L "$LOCK_DIR" || ( -e "$LOCK_DIR" && ! -d "$LOCK_DIR" ) ]]; then
+  die "$LOCK_DIR must be a real directory"
+fi
+if [[ ! -e "$LOCK_DIR" ]]; then
+  install -d -o root -g root -m 0700 "$LOCK_DIR"
+fi
+[[ "$(stat -c '%u:%g:%a' "$LOCK_DIR")" == "0:0:700" ]] || die "$LOCK_DIR must be root:root mode 0700"
+LOCK_FILE="$LOCK_DIR/update.lock"
+if [[ -L "$LOCK_FILE" || ( -e "$LOCK_FILE" && ! -f "$LOCK_FILE" ) ]]; then
+  die "$LOCK_FILE must be a regular file"
+fi
+if [[ ! -e "$LOCK_FILE" ]]; then
+  ( umask 077; set -o noclobber; : >"$LOCK_FILE" ) 2>/dev/null || true
+fi
+[[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] || die "$LOCK_FILE creation failed"
+[[ "$(stat -c '%u:%g:%a' "$LOCK_FILE")" == "0:0:600" ]] || die "$LOCK_FILE must be root:root mode 0600"
+exec 9<>"$LOCK_FILE"
+flock -n 9 || die "another server operation is already running"
+
+validate_health_url() {
+  local url=$1 port
+  if [[ "$url" =~ ^http://127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}:([1-9][0-9]{0,4})/healthz$ ]]; then
+    port=${BASH_REMATCH[1]}
+  elif [[ "$url" =~ ^http://\[::1\]:([1-9][0-9]{0,4})/healthz$ ]]; then
+    port=${BASH_REMATCH[1]}
   else
-    echo "  git clone 全部失败,改走 tar.gz..."
-    rm -rf "$SRC_DIR"
-    mkdir -p "$SRC_DIR"
-    if fetch_via_proxies \
-        "https://github.com/GeekASMR/network-ultra-server/archive/refs/heads/main.tar.gz" \
-        /tmp/network-ultra-src.tar.gz; then
-      tar xzf /tmp/network-ultra-src.tar.gz -C "$SRC_DIR" --strip-components=1
-      rm -f /tmp/network-ultra-src.tar.gz
-      echo "  已解压到 $SRC_DIR (tar.gz)"
+    return 1
+  fi
+  (( port >= 1 && port <= 65535 ))
+}
+
+SOURCE_COMMIT="${NU_SOURCE_COMMIT:-}"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "NU_SOURCE_COMMIT must be an audited lowercase 40-character commit SHA"
+RELEASE_VERSION="${NU_RELEASE_VERSION:-$SOURCE_COMMIT}"
+[[ "$RELEASE_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$ ]] || die "NU_RELEASE_VERSION contains unsafe characters"
+
+GO_MAJOR=$(go env GOVERSION | sed -E 's/^go([0-9]+)\.([0-9]+).*/\1/')
+GO_MINOR=$(go env GOVERSION | sed -E 's/^go([0-9]+)\.([0-9]+).*/\2/')
+(( GO_MAJOR > 1 || (GO_MAJOR == 1 && GO_MINOR >= 22) )) || die "Go 1.22 or newer is required"
+
+SRC_PARENT=$(dirname -- "$SRC_DIR")
+if [[ -L "$SRC_PARENT" || ( -e "$SRC_PARENT" && ! -d "$SRC_PARENT" ) ]]; then
+  die "$SRC_PARENT must be a real directory"
+fi
+if [[ ! -e "$SRC_PARENT" ]]; then
+  install -d -o root -g root -m 0755 "$SRC_PARENT"
+fi
+[[ "$(stat -c '%u:%g' "$SRC_PARENT")" == "0:0" ]] || die "$SRC_PARENT must be owned by root:root"
+SRC_PARENT_MODE=$(stat -c '%a' "$SRC_PARENT")
+(( (8#$SRC_PARENT_MODE & 0022) == 0 )) || die "$SRC_PARENT must not be group/other writable"
+STAGE=$(mktemp -d "$SRC_PARENT/.network-ultra-install.XXXXXX")
+OLD_SRC="${SRC_DIR}.rollback.$$"
+NEW_BIN="${BIN_PATH}.new.$$"
+ORIGINAL_SRC_PRESENT=0
+if [[ -e "$SRC_DIR" ]]; then ORIGINAL_SRC_PRESENT=1; fi
+HAD_OLD_SRC=0
+HAD_OLD_BIN=0
+HAD_OLD_SERVICE=0
+HAD_OLD_CONFIG=0
+HAD_CONFIG_DIR=0
+HAD_STATE_DIR=0
+CREATED_USER=0
+SOURCE_MOVED=0
+WAS_ACTIVE=0
+WAS_ENABLED=0
+MUTATED=0
+SUCCESS=0
+rollback_install() {
+  local status=$?
+  trap - EXIT INT TERM
+  set +e
+  if [[ "$SUCCESS" -ne 1 && "$MUTATED" -eq 1 ]]; then
+    systemctl stop network-ultra-server >/dev/null 2>&1 || true
+    if [[ "$HAD_OLD_BIN" -eq 1 ]]; then install -m 0755 "$STAGE/old.bin" "$BIN_PATH"; else rm -f -- "$BIN_PATH"; fi
+    restore_source_tree "$SRC_DIR" "$OLD_SRC" "$STAGE/src" "$ORIGINAL_SRC_PRESENT" "$SOURCE_MOVED"
+    if [[ "$HAD_OLD_SERVICE" -eq 1 ]]; then install -m 0644 "$STAGE/old.service" "$SVC_FILE"; else rm -f -- "$SVC_FILE"; fi
+    if [[ "$HAD_OLD_CONFIG" -eq 1 ]]; then
+      rm -f -- "$CFG_FILE"
+      cp --preserve=mode,ownership,timestamps -- "$STAGE/old.config" "$CFG_FILE"
     else
-      c_red "无法从任何代理下载源码,请检查网络或手动 git clone"
-      exit 1
+      rm -f -- "$CFG_FILE"
     fi
+    if [[ "$HAD_CONFIG_DIR" -ne 1 ]]; then rmdir -- "$CFG_DIR" >/dev/null 2>&1 || true; fi
+    systemctl daemon-reload || true
+    if [[ "$WAS_ENABLED" -eq 1 ]]; then systemctl enable network-ultra-server >/dev/null 2>&1 || true; else systemctl disable network-ultra-server >/dev/null 2>&1 || true; fi
+    if [[ "$WAS_ACTIVE" -eq 1 ]]; then systemctl start network-ultra-server || true; fi
+    if [[ "$HAD_STATE_DIR" -ne 1 ]]; then rm -rf -- "$STATE_DIR"; fi
+    if [[ "$CREATED_USER" -eq 1 ]]; then userdel "$SERVICE_USER" >/dev/null 2>&1 || true; fi
   fi
-fi
+  rm -f -- "$NEW_BIN"
+  rm -rf -- "$STAGE"
+  exit "$status"
+}
+trap rollback_install EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+install -d -m 0755 "$STAGE/src"
+git -C "$STAGE/src" init
+git -C "$STAGE/src" remote add origin "$REPO_URL"
+git -c protocol.file.allow=never -C "$STAGE/src" fetch --depth 1 origin "$SOURCE_COMMIT"
+git -C "$STAGE/src" checkout --detach FETCH_HEAD
+ACTUAL_COMMIT=$(git -C "$STAGE/src" rev-parse HEAD)
+[[ "$ACTUAL_COMMIT" == "$SOURCE_COMMIT" ]] || die "source commit verification failed"
 
-step "4/7" "下载依赖并编译"
-cd "$SRC_DIR"
-# GOPROXY 优先走国内代理,失败回落 direct
-export GOPROXY="${GOPROXY:-https://goproxy.cn,https://proxy.golang.org,direct}"
-export GOSUMDB="${GOSUMDB:-off}"
+export GOPROXY="https://proxy.golang.org,direct"
+export GOSUMDB="sum.golang.org"
 export CGO_ENABLED=0
+cd "$STAGE/src"
+go mod download
+go mod verify
+go test ./...
+go build -trimpath -ldflags="-s -w -X main.buildVersion=$RELEASE_VERSION" -o "$STAGE/network-ultra-server" ./cmd/server
+[[ "$("$STAGE/network-ultra-server" -version)" == "network-ultra-server $RELEASE_VERSION" ]] || die "built version verification failed"
+[[ -f "$STAGE/src/systemd/network-ultra-server.service" ]] || die "pinned source is missing the systemd service unit"
+cd /
 
-echo "  下载依赖..."
-go mod tidy
-echo "  编译中..."
-go build -trimpath -ldflags="-s -w -X main.buildVersion=$(git rev-parse --short HEAD)" \
-  -o "$BIN_PATH" ./cmd/server
-echo "  二进制大小 $(ls -lh $BIN_PATH | awk '{print $5}'),已写入 $BIN_PATH"
+if [[ -d "$CFG_DIR" ]]; then HAD_CONFIG_DIR=1; fi
+if [[ -d "$STATE_DIR" ]]; then HAD_STATE_DIR=1; fi
+if [[ -f "$CFG_FILE" ]]; then cp --preserve=mode,ownership,timestamps -- "$CFG_FILE" "$STAGE/old.config"; HAD_OLD_CONFIG=1; fi
+if [[ -f "$BIN_PATH" ]]; then cp --preserve=mode,ownership,timestamps "$BIN_PATH" "$STAGE/old.bin"; HAD_OLD_BIN=1; fi
+if [[ -f "$SVC_FILE" ]]; then cp --preserve=mode,ownership,timestamps "$SVC_FILE" "$STAGE/old.service"; HAD_OLD_SERVICE=1; fi
+if systemctl is-active --quiet network-ultra-server 2>/dev/null; then WAS_ACTIVE=1; fi
+if systemctl is-enabled --quiet network-ultra-server 2>/dev/null; then WAS_ENABLED=1; fi
 
-step "5/7" "生成配置文件"
-mkdir -p "$CFG_DIR"
-ADMIN_TOKEN=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 64)
-
-# 服务器连接密码(v1.3+)。所有连进来的 VST 客户端都要在 hello 中携带匹配的密码。
-# 留空 = 兼容旧客户端、任何人都能连。
-# 优先级:
-#   1. 命令行环境变量 NU_SERVER_PASSWORD (无人值守安装专用)
-#   2. 已有 config.toml 中的现存值 (升级保留)
-#   3. 交互输入 (默认随机生成 12 字符)
-#   4. 用户按回车跳过 = 公开服务器
-EXISTING_PWD=""
-if [[ -f "$CFG_FILE" ]]; then
-  EXISTING_PWD=$(awk -F\" '/^password[[:space:]]*=/ {print $2; exit}' "$CFG_FILE" 2>/dev/null || echo "")
-fi
-if [[ -n "${NU_SERVER_PASSWORD:-}" ]]; then
-  SERVER_PWD="$NU_SERVER_PASSWORD"
-  echo "  已从环境变量读取服务器密码 (NU_SERVER_PASSWORD)"
-elif [[ -n "$EXISTING_PWD" ]]; then
-  SERVER_PWD="$EXISTING_PWD"
-  echo "  保留 $CFG_FILE 中已有的服务器密码"
-else
-  RAND_PWD=$(openssl rand -base64 9 2>/dev/null | tr -d '/+=' | head -c 12 || head -c 9 /dev/urandom | base64 | tr -d '/+=' | head -c 12)
-  if [[ -t 0 ]]; then
-    # 交互式终端:让用户决定
-    echo ""
-    c_blu "  设置服务器密码(只有知道密码的客户端才能连接):"
-    echo "    ① 直接回车 = 使用建议的随机密码 [$RAND_PWD]"
-    echo "    ② 输入 'open' = 不设密码,任何人都能连"
-    echo "    ③ 直接输入你想用的密码"
-    read -r -p "  > " USER_INPUT < /dev/tty || USER_INPUT=""
-    case "$USER_INPUT" in
-      "")     SERVER_PWD="$RAND_PWD" ;;
-      "open") SERVER_PWD="" ;;
-      *)      SERVER_PWD="$USER_INPUT" ;;
-    esac
-  else
-    # 非交互(管道安装):默认随机密码
-    SERVER_PWD="$RAND_PWD"
-    echo "  非交互模式,使用随机密码"
+CONFIG_FOR_HEALTH="$CFG_FILE"
+if [[ ! -f "$CFG_FILE" ]]; then
+  SERVER_PASSWORD="${NU_SERVER_PASSWORD:-$(openssl rand -hex 16)}"
+  if NU_RAW_PASSWORD="$SERVER_PASSWORD" LC_ALL=C awk 'BEGIN { exit(ENVIRON["NU_RAW_PASSWORD"] ~ /[[:cntrl:]]/ ? 0 : 1) }'; then
+    die "NU_SERVER_PASSWORD must not contain control characters"
   fi
-fi
-
-if [[ -f "$CFG_FILE" ]]; then
-  echo "  $CFG_FILE 已存在,保留原配置不覆盖。"
-else
-  cat > "$CFG_FILE" <<EOF
+  if NU_RAW_PASSWORD="$SERVER_PASSWORD" LC_ALL=C awk 'BEGIN { exit(length(ENVIRON["NU_RAW_PASSWORD"]) > 72 ? 0 : 1) }'; then
+    die "NU_SERVER_PASSWORD exceeds bcrypt's 72-byte UTF-8 limit"
+  fi
+  TOML_SERVER_PASSWORD="${SERVER_PASSWORD//\\/\\\\}"
+  TOML_SERVER_PASSWORD="${TOML_SERVER_PASSWORD//\"/\\\"}"
+  ADMIN_TOKEN=$(openssl rand -hex 32)
+  CONFIG_FOR_HEALTH="$STAGE/new.config"
+  cat >"$CONFIG_FOR_HEALTH" <<EOF
 [server]
-listen = "0.0.0.0:18900"
+listen = "127.0.0.1:18900"
 health_listen = "127.0.0.1:18901"
+udp_listen = ""
+allow_insecure_public = false
+allow_insecure_udp = false
 max_rooms = 50
 max_peers_per_room = 8
 max_connections = 200
-admin_token = "${ADMIN_TOKEN}"
-password = "${SERVER_PWD}"
+admin_token = "$ADMIN_TOKEN"
+password = "$TOML_SERVER_PASSWORD"
+trusted_proxies = []
 
 [tls]
 enabled = false
 cert_file = ""
 key_file = ""
 auto_letsencrypt = false
-domain = ""
-email = ""
 
 [log]
 level = "info"
 format = "json"
-path = ""
 
 [ratelimit]
 hello_per_ip_per_minute = 10
 room_create_per_peer_per_minute = 5
 room_join_per_peer_per_minute = 30
 room_list_per_peer_per_minute = 60
+control_per_peer_per_minute = 120
 audio_frames_per_peer_per_second = 200
+password_checks_concurrent = 4
 EOF
-  chmod 0640 "$CFG_FILE"
-  echo "  已写入 $CFG_FILE"
+  chmod 0600 "$CONFIG_FOR_HEALTH"
 fi
+HEALTH_URL=$("$STAGE/network-ultra-server" -config "$CONFIG_FOR_HEALTH" -print-health-url) || die "config has no valid loopback health URL"
+validate_health_url "$HEALTH_URL" || die "config health URL is not a strict loopback HTTP endpoint"
 
-step "6/7" "注册 systemd 服务"
-cat > "$SVC_FILE" <<'EOF'
-[Unit]
-Description=Network Ultra Audio Server
-Documentation=https://github.com/GeekASMR/network-ultra-server
-After=network.target
+[[ ! -e "$OLD_SRC" ]] || die "rollback path already exists: $OLD_SRC"
+[[ ! -e "$NEW_BIN" ]] || die "staged binary path already exists: $NEW_BIN"
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/network-ultra-server -config /etc/network-ultra/config.toml
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65536
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ReadWritePaths=/var/lib/network-ultra
-ReadOnlyPaths=/etc/network-ultra
-StateDirectory=network-ultra
-StateDirectoryMode=0700
+MUTATED=1
+if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+  useradd --system --home "$STATE_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
+  CREATED_USER=1
+fi
+install -d -o root -g "$SERVICE_USER" -m 0750 "$CFG_DIR"
+if [[ ! -f "$CFG_FILE" ]]; then
+  install -o root -g "$SERVICE_USER" -m 0640 "$CONFIG_FOR_HEALTH" "$CFG_FILE"
+fi
+chown root:"$SERVICE_USER" "$CFG_FILE"
+chmod 0640 "$CFG_FILE"
 
-[Install]
-WantedBy=multi-user.target
-EOF
+# The temporary binary is not live until the final rename.
+install -m 0755 "$STAGE/network-ultra-server" "$NEW_BIN"
+systemctl stop network-ultra-server >/dev/null 2>&1 || true
+
+# Defer termination during the two same-filesystem source renames. The helper
+# records a pending signal and completes the atomic pair before rollback runs.
+switch_source_tree "$SRC_DIR" "$STAGE/src" "$OLD_SRC"
+
+mv -- "$NEW_BIN" "$BIN_PATH"
+install -m 0644 "$SRC_DIR/systemd/network-ultra-server.service" "$SVC_FILE"
 systemctl daemon-reload
-systemctl enable --now network-ultra-server >/dev/null
-echo "  systemd 服务已启动"
+systemctl enable network-ultra-server >/dev/null
+systemctl restart network-ultra-server
 
-step "7/7" "健康检查"
-HEALTH_OK=0
-for _ in 1 2 3 4 5; do
-  sleep 1
-  if curl -fs http://127.0.0.1:18901/healthz > /dev/null 2>&1; then
-    HEALTH_OK=1; break
+for _ in {1..10}; do
+  HEALTH_BODY=$(curl --proto '=http' --globoff --noproxy '*' --connect-timeout 1 --max-time 2 -fsS "$HEALTH_URL" 2>/dev/null || true)
+  if systemctl is-active --quiet network-ultra-server \
+    && [[ "$HEALTH_BODY" == *'"status":"ok"'* ]] \
+    && [[ "$HEALTH_BODY" == *"\"version\":\"$RELEASE_VERSION\""* ]]; then
+    SUCCESS=1
+    if [[ "$HAD_OLD_SRC" -eq 1 ]]; then rm -rf -- "$OLD_SRC"; fi
+    printf 'installed commit %s; secure endpoint is loopback-only until TLS/reverse proxy is configured\n' "$SOURCE_COMMIT"
+    exit 0
   fi
+  sleep 1
 done
-if [[ "$HEALTH_OK" -ne 1 ]]; then
-  c_red "健康检查失败,请查看日志:journalctl -u network-ultra-server -n 50"
-  exit 1
-fi
-echo "  /healthz 响应正常"
-
-PUB_IP=$(curl -fs --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
-[[ -z "$PUB_IP" ]] && PUB_IP=$(curl -fs --max-time 3 https://ifconfig.me 2>/dev/null || echo "")
-[[ -z "$PUB_IP" ]] && PUB_IP="<服务器公网 IP>"
-
-cat <<EOF
-
-═════════════════════════════════════════════════════════════
-$(c_grn "  Network Ultra Server 已成功启动")
-═════════════════════════════════════════════════════════════
-
-  在 VST 插件里填入服务器地址:
-    $(c_blu "ws://${PUB_IP}:18900")
-
-EOF
-if [[ -n "${SERVER_PWD:-}" ]]; then
-cat <<EOF
-  $(c_grn "服务器密码(分发给信任的客户端):")
-    $(c_blu "${SERVER_PWD}")
-
-  客户端在"服务器密码"栏填入此值才能连接。
-  改密码:编辑 $CFG_FILE 的 password = "...",然后 systemctl restart network-ultra-server
-
-EOF
-else
-cat <<EOF
-  $(c_blu "(此服务器未设置密码,任何人都能连接)")
-  设置密码:编辑 $CFG_FILE 的 password = "你的密码",然后 systemctl restart network-ultra-server
-
-EOF
-fi
-cat <<EOF
-  Admin Token(已写入 $CFG_FILE):
-    ${ADMIN_TOKEN}
-
-  常用命令:
-    systemctl status network-ultra-server   # 查看服务状态
-    journalctl -u network-ultra-server -f   # 看实时日志
-    curl http://127.0.0.1:18901/healthz     # 健康检查
-    curl http://127.0.0.1:18901/metrics     # Prometheus 指标
-
-  以后升级:
-    再跑一次同样的命令即可
-    curl -fsSL https://raw.githubusercontent.com/GeekASMR/network-ultra-server/main/scripts/install-from-source.sh | sudo bash
-
-    国内访问慢?走代理:
-    curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/GeekASMR/network-ultra-server/main/scripts/install-from-source.sh | sudo bash
-
-  需要 TLS 域名?编辑 $CFG_FILE 的 [tls] 段后重启服务。
-  文档:https://github.com/GeekASMR/network-ultra-server
-
-EOF
+die "health check failed; inspect journalctl -u network-ultra-server"

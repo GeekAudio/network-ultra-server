@@ -8,145 +8,293 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
-// portIsFree returns true if we can bind a TCP listener on `addr` right now.
-// We rely on actual bind+close semantics rather than enumerating sockets,
-// because Windows has multiple address families and cached state.
+const (
+	processTerminate               = 0x0001
+	processQueryLimitedInformation = 0x1000
+	synchronize                    = 0x00100000
+	tcpTableOwnerPIDListener       = 3
+	errorInsufficientBuffer        = 122
+	waitObject0                    = 0
+	waitTimeout                    = 258
+	terminateWaitMillis            = 5000
+)
+
+var (
+	procGetExtendedTCPTable        = syscall.NewLazyDLL("iphlpapi.dll").NewProc("GetExtendedTcpTable")
+	procQueryFullProcessImageNameW = syscall.NewLazyDLL("kernel32.dll").NewProc("QueryFullProcessImageNameW")
+)
+
+type mibTCPRowOwnerPID struct {
+	State      uint32
+	LocalAddr  uint32
+	LocalPort  uint32
+	RemoteAddr uint32
+	RemotePort uint32
+	OwningPID  uint32
+}
+
+type mibTCP6RowOwnerPID struct {
+	LocalAddr     [16]byte
+	LocalScopeID  uint32
+	LocalPort     uint32
+	RemoteAddr    [16]byte
+	RemoteScopeID uint32
+	RemotePort    uint32
+	State         uint32
+	OwningPID     uint32
+}
+
+type verifiedProcess struct {
+	pid    int
+	handle syscall.Handle
+	path   string
+}
+
+// portIsFree returns true if we can bind a TCP listener on addr right now.
 func portIsFree(addr string) bool {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return false
 	}
 	_ = l.Close()
-	// Give Windows a beat to actually free the socket — TIME_WAIT can
-	// re-block immediately if we sprint into the next listen.
 	time.Sleep(50 * time.Millisecond)
 	return true
 }
 
-// reclaimPort tries to identify the process holding `addr` and, if it's our
-// own binary (network-ultra-bridge.exe — common after DAW crash leaves a
-// zombie), kills it. Refuses to touch any other process kind so we never
-// accidentally murder some user's SSH server or whatever happens to live
-// on 18900.
+// reclaimPort enumerates only the exact listening IP:port, opens every holder
+// once with QUERY|TERMINATE|SYNCHRONIZE, verifies its image path through that
+// same handle, rechecks socket ownership, and terminates through the same
+// handle. PID reuse therefore cannot redirect termination to a new process.
 func reclaimPort(addr string, log *slog.Logger) error {
-	_, portStr, err := net.SplitHostPort(addr)
+	pids, err := pidsHoldingAddr(addr)
 	if err != nil {
-		return fmt.Errorf("parse addr: %w", err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port <= 0 {
-		return fmt.Errorf("invalid port: %s", portStr)
-	}
-
-	pids, err := pidsHoldingPort(port)
-	if err != nil {
-		return fmt.Errorf("enumerate port holders: %w", err)
+		return fmt.Errorf("enumerate exact listener: %w", err)
 	}
 	if len(pids) == 0 {
-		return errors.New("port appears busy but no holder found (maybe TIME_WAIT)")
+		return errors.New("address appears busy but no exact listener holder was found")
 	}
 
-	myExe, err := os.Executable()
+	currentHandle, err := syscall.GetCurrentProcess()
 	if err != nil {
-		return fmt.Errorf("os.Executable: %w", err)
+		return fmt.Errorf("GetCurrentProcess: %w", err)
 	}
-	myBase := strings.ToLower(filepath.Base(myExe))
-	myPid := os.Getpid()
+	currentPath, err := queryProcessImagePath(currentHandle)
+	if err != nil {
+		return fmt.Errorf("query own executable: %w", err)
+	}
 
-	var killed []int
+	opened := make([]verifiedProcess, 0, len(pids))
+	defer func() {
+		for _, process := range opened {
+			_ = syscall.CloseHandle(process.handle)
+		}
+	}()
 	for _, pid := range pids {
-		if pid == myPid {
+		if pid == os.Getpid() {
 			continue
 		}
-		exe, err := exePathOfPID(pid)
+		handle, err := syscall.OpenProcess(
+			processQueryLimitedInformation|processTerminate|synchronize,
+			false,
+			uint32(pid),
+		)
 		if err != nil {
-			log.Warn("can't read exe for pid; skipping",
-				"pid", pid, "err", err)
-			continue
+			return fmt.Errorf("open listener pid %d with fixed handle: %w", pid, err)
 		}
-		base := strings.ToLower(filepath.Base(exe))
-		if base != myBase {
-			return fmt.Errorf(
-				"port %d held by %q (pid %d), not ours (%q); refusing to kill",
-				port, exe, pid, myBase)
+		path, err := queryProcessImagePath(handle)
+		if err != nil {
+			_ = syscall.CloseHandle(handle)
+			return fmt.Errorf("query listener pid %d image: %w", pid, err)
 		}
-		// Same binary name → safe to kill.
-		log.Info("killing stale bridge instance", "pid", pid, "exe", exe)
-		if err := killPID(pid); err != nil {
-			log.Warn("kill failed", "pid", pid, "err", err)
-			continue
+		if !sameCanonicalExecutable(currentPath, path) {
+			_ = syscall.CloseHandle(handle)
+			return fmt.Errorf("address held by %q (pid %d), not exact executable %q; refusing to terminate", path, pid, currentPath)
 		}
-		killed = append(killed, pid)
+		opened = append(opened, verifiedProcess{pid: pid, handle: handle, path: path})
+	}
+	if len(opened) == 0 {
+		return errors.New("no stale bridge listener eligible for termination")
 	}
 
-	if len(killed) == 0 {
-		return errors.New("no stale bridge process killed")
+	confirmed, err := pidsHoldingAddr(addr)
+	if err != nil {
+		return fmt.Errorf("recheck exact listener ownership: %w", err)
+	}
+	if !allPIDsStillHolding(opened, confirmed) {
+		return errors.New("listener ownership changed during verification; refusing to terminate")
+	}
+
+	for _, process := range opened {
+		log.Info("terminating verified stale bridge", "pid", process.pid, "exe", process.path)
+		if err := syscall.TerminateProcess(process.handle, 1); err != nil {
+			return fmt.Errorf("terminate verified pid %d: %w", process.pid, err)
+		}
+		result, err := syscall.WaitForSingleObject(process.handle, terminateWaitMillis)
+		if err != nil {
+			return fmt.Errorf("wait for verified pid %d: %w", process.pid, err)
+		}
+		if result == waitTimeout {
+			return fmt.Errorf("verified pid %d did not exit within timeout", process.pid)
+		}
+		if result != waitObject0 {
+			return fmt.Errorf("wait for verified pid %d returned %#x", process.pid, result)
+		}
 	}
 	return nil
 }
 
-// pidsHoldingPort uses PowerShell's Get-NetTCPConnection to find PIDs
-// that have the given local port in LISTEN state. PowerShell is always
-// present on Windows 10+ which is our minimum supported platform, and
-// avoids us having to vendor a syscall-level socket enumerator.
-func pidsHoldingPort(port int) ([]int, error) {
-	cmd := exec.Command("powershell", "-NoProfile", "-Command",
-		fmt.Sprintf(
-			"(Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess) -join ','",
-			port))
-	out, err := cmd.Output()
+func queryProcessImagePath(handle syscall.Handle) (string, error) {
+	for size := uint32(512); size <= 32768; size *= 2 {
+		buf := make([]uint16, size)
+		chars := size
+		r1, _, callErr := procQueryFullProcessImageNameW.Call(
+			uintptr(handle),
+			0,
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(unsafe.Pointer(&chars)),
+		)
+		if r1 != 0 {
+			return normalizeProcessImagePath(syscall.UTF16ToString(buf[:chars]))
+		}
+		if callErr != syscall.ERROR_INSUFFICIENT_BUFFER {
+			return "", callErr
+		}
+	}
+	return "", errors.New("process image path exceeds Windows limit")
+}
+
+func normalizeProcessImagePath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	path = strings.TrimPrefix(path, `\\?\`)
+	if path == "" || !filepath.IsAbs(path) {
+		return "", errors.New("process image path is not absolute")
+	}
+	return filepath.Clean(path), nil
+}
+
+func sameCanonicalExecutable(current, candidate string) bool {
+	return strings.EqualFold(filepath.Clean(current), filepath.Clean(candidate))
+}
+
+func allPIDsStillHolding(opened []verifiedProcess, confirmed []int) bool {
+	set := make(map[int]struct{}, len(confirmed))
+	for _, pid := range confirmed {
+		set[pid] = struct{}{}
+	}
+	for _, process := range opened {
+		if _, ok := set[process.pid]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func pidsHoldingAddr(addr string) ([]int, error) {
+	host, portText, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
-	s := strings.TrimSpace(string(out))
-	if s == "" {
-		return nil, nil
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil || !ip.IsLoopback() {
+		return nil, errors.New("reclaim address must use an explicit loopback IP")
 	}
-	var pids []int
-	for _, p := range strings.Split(s, ",") {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		n, err := strconv.Atoi(p)
-		if err != nil {
-			continue
-		}
-		pids = append(pids, n)
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, errors.New("reclaim port must be between 1 and 65535")
 	}
-	return pids, nil
+	if ip4 := ip.To4(); ip4 != nil {
+		return pidsFromTCP4Table(ip4, port)
+	}
+	return pidsFromTCP6Table(ip.To16(), port)
 }
 
-// exePathOfPID fetches the full path of a process binary. Falls back to
-// just the name if the path can't be retrieved (rare; usually means the
-// process exited between enumerate and inspect).
-func exePathOfPID(pid int) (string, error) {
-	cmd := exec.Command("powershell", "-NoProfile", "-Command",
-		fmt.Sprintf("(Get-Process -Id %d -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path)", pid))
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
+func tcpTable(addressFamily uint32) ([]byte, error) {
+	var size uint32
+	result, _, _ := procGetExtendedTCPTable.Call(
+		0,
+		uintptr(unsafe.Pointer(&size)),
+		0,
+		uintptr(addressFamily),
+		tcpTableOwnerPIDListener,
+		0,
+	)
+	if result != errorInsufficientBuffer || size < 4 {
+		return nil, fmt.Errorf("GetExtendedTcpTable size returned %d (size %d)", result, size)
 	}
-	s := strings.TrimSpace(string(out))
-	if s == "" {
-		return "", fmt.Errorf("no Path for pid %d", pid)
+	buf := make([]byte, size)
+	result, _, _ = procGetExtendedTCPTable.Call(
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&size)),
+		0,
+		uintptr(addressFamily),
+		tcpTableOwnerPIDListener,
+		0,
+	)
+	if result != 0 {
+		return nil, syscall.Errno(result)
 	}
-	return s, nil
+	return buf[:size], nil
 }
 
-// killPID issues a force-kill via taskkill (sends WM_CLOSE first, then
-// terminates). Equivalent to `taskkill /F /PID xxx`.
-func killPID(pid int) error {
-	out, err := exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
+func pidsFromTCP4Table(target net.IP, targetPort int) ([]int, error) {
+	buf, err := tcpTable(syscall.AF_INET)
 	if err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+		return nil, err
 	}
-	return nil
+	count := *(*uint32)(unsafe.Pointer(&buf[0]))
+	rowSize := unsafe.Sizeof(mibTCPRowOwnerPID{})
+	if uint64(4)+uint64(count)*uint64(rowSize) > uint64(len(buf)) {
+		return nil, errors.New("truncated IPv4 TCP owner table")
+	}
+	set := make(map[int]struct{})
+	for index := uint32(0); index < count; index++ {
+		row := (*mibTCPRowOwnerPID)(unsafe.Add(unsafe.Pointer(&buf[4]), uintptr(index)*rowSize))
+		ip := net.IPv4(byte(row.LocalAddr), byte(row.LocalAddr>>8), byte(row.LocalAddr>>16), byte(row.LocalAddr>>24))
+		if ip.Equal(target) && networkPort(row.LocalPort) == targetPort {
+			set[int(row.OwningPID)] = struct{}{}
+		}
+	}
+	return sortedPIDs(set), nil
+}
+
+func pidsFromTCP6Table(target net.IP, targetPort int) ([]int, error) {
+	buf, err := tcpTable(syscall.AF_INET6)
+	if err != nil {
+		return nil, err
+	}
+	count := *(*uint32)(unsafe.Pointer(&buf[0]))
+	rowSize := unsafe.Sizeof(mibTCP6RowOwnerPID{})
+	if uint64(4)+uint64(count)*uint64(rowSize) > uint64(len(buf)) {
+		return nil, errors.New("truncated IPv6 TCP owner table")
+	}
+	set := make(map[int]struct{})
+	for index := uint32(0); index < count; index++ {
+		row := (*mibTCP6RowOwnerPID)(unsafe.Add(unsafe.Pointer(&buf[4]), uintptr(index)*rowSize))
+		if net.IP(row.LocalAddr[:]).Equal(target) && networkPort(row.LocalPort) == targetPort {
+			set[int(row.OwningPID)] = struct{}{}
+		}
+	}
+	return sortedPIDs(set), nil
+}
+
+func networkPort(raw uint32) int {
+	return int(byte(raw))<<8 | int(byte(raw>>8))
+}
+
+func sortedPIDs(set map[int]struct{}) []int {
+	pids := make([]int, 0, len(set))
+	for pid := range set {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	return pids
 }

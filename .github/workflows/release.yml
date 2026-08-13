@@ -6,7 +6,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -26,28 +26,45 @@ jobs:
             goarch: amd64
             ext: ".exe"
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          go-version: '1.22'
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
           cache: true
 
       - name: Build
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
         run: |
+          set -euo pipefail
+          TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          [[ "$GITHUB_REF_NAME" =~ $TAG_RE ]] || {
+            echo "release tag is not canonical semver: $GITHUB_REF_NAME" >&2
+            exit 1
+          }
+          VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist
-          go mod tidy
-          go build -trimpath -ldflags="-s -w" \
-            -o dist/network-ultra-server-${{ matrix.target }}${{ matrix.ext }} \
+          go mod download
+          go mod verify
+          go test ./...
+          ARTIFACT="dist/network-ultra-server-${{ matrix.target }}${{ matrix.ext }}"
+          BUILD_ID="network-ultra-server/$VERSION/${{ matrix.target }}"
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w -buildid=$BUILD_ID -X main.buildVersion=$VERSION" \
+            -o "$ARTIFACT" \
             ./cmd/server
-          ( cd dist && sha256sum network-ultra-server-${{ matrix.target }}${{ matrix.ext }} \
-            > network-ultra-server-${{ matrix.target }}${{ matrix.ext }}.sha256 )
+          [[ "$(go tool buildid "$ARTIFACT")" == "$BUILD_ID" ]]
+          BUILD_INFO=$(go version -m "$ARTIFACT")
+          grep -F -- "GOOS=${{ matrix.goos }}" <<<"$BUILD_INFO"
+          grep -F -- "GOARCH=${{ matrix.goarch }}" <<<"$BUILD_INFO"
+          if [[ "${{ matrix.target }}" == "linux-amd64" ]]; then
+            [[ "$("$ARTIFACT" -version)" == "network-ultra-server $VERSION" ]]
+          fi
+          ( cd dist && sha256sum "$(basename "$ARTIFACT")" \
+            > "$(basename "$ARTIFACT").sha256" )
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bin-${{ matrix.target }}
           path: dist/*
@@ -56,20 +73,45 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Re-verify downloaded release artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          for TARGET in linux-amd64 linux-arm64 windows-amd64; do
+            EXT=""
+            if [[ "$TARGET" == windows-amd64 ]]; then EXT=".exe"; fi
+            ARTIFACT="network-ultra-server-$TARGET$EXT"
+            test -f "dist/$ARTIFACT"
+            test -f "dist/$ARTIFACT.sha256"
+            ( cd dist && sha256sum -c "$ARTIFACT.sha256" )
+            [[ "$(go tool buildid "dist/$ARTIFACT")" == "network-ultra-server/$VERSION/$TARGET" ]]
+          done
+          [[ "$(dist/network-ultra-server-linux-amd64 -version)" == "network-ultra-server $VERSION" ]]
+          [[ "$(find dist -maxdepth 1 -type f | wc -l)" -eq 6 ]]
 
       - name: Stage install.sh + install.ps1
         run: |
           cp scripts/install.sh dist/install.sh
           cp scripts/install.ps1 dist/install.ps1 2>/dev/null || true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           generate_release_notes: true

@@ -30,13 +30,13 @@ const (
 	UdpPingSize    = 20 // 1 type + 3 reserved + 16 peerId
 	UdpPongSize    = 20 // same as ping (server echoes)
 
-	UdpTokenSize = 32 // raw bytes; HMAC of (peerId || nonce) — opaque to client
+	UdpTokenSize = 32 // raw per-session random bytes — opaque to client
 )
 
 var (
-	ErrUdpTooShort  = errors.New("udp frame: too short")
-	ErrUdpBadType   = errors.New("udp frame: invalid type byte")
-	ErrUdpBadSize   = errors.New("udp frame: size mismatch")
+	ErrUdpTooShort = errors.New("udp frame: too short")
+	ErrUdpBadType  = errors.New("udp frame: invalid type byte")
+	ErrUdpBadSize  = errors.New("udp frame: size mismatch")
 )
 
 // UdpHelloFrame is sent by the client immediately after WS welcome to bind

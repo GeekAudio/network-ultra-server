@@ -3,15 +3,16 @@
 // client needs to match byte-for-byte.
 //
 // Usage:
-//   go run ./cmd/testclient -server ws://146.56.202.138:18900 -username Akimi -room demo
+//
+//	go run ./cmd/testclient -server ws://146.56.202.138:18900 -username Akimi -room demo
 //
 // What it does:
-//   1. Open WebSocket
-//   2. Send hello, expect welcome
-//   3. Create room (or join if it exists)
-//   4. Send N synthesised audio frames (silence, well-formed)
-//   5. Print every server message as JSON
-//   6. Send room_leave + close
+//  1. Open WebSocket
+//  2. Send hello, expect welcome
+//  3. Create room (or join if it exists)
+//  4. Send N synthesised audio frames (silence, well-formed)
+//  5. Print every server message as JSON
+//  6. Send room_leave + close
 package main
 
 import (

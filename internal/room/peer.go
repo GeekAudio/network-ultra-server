@@ -26,6 +26,9 @@ type Peer struct {
 	Username string
 	Role     string // "send" | "recv"
 	JoinedAt time.Time
+	// RemoteIP is captured once from the authenticated WebSocket transport.
+	// It is used only as a stable rate-limit dimension across reconnects.
+	RemoteIP string
 
 	// muted is per-peer self-mute (Send peer flagging itself).
 	muted atomic.Bool
@@ -59,8 +62,8 @@ func NewPeer(username, role string) *Peer {
 	}
 }
 
-func (p *Peer) Muted() bool       { return p.muted.Load() }
-func (p *Peer) SetMuted(v bool)   { p.muted.Store(v) }
+func (p *Peer) Muted() bool     { return p.muted.Load() }
+func (p *Peer) SetMuted(v bool) { p.muted.Store(v) }
 
 // IsSubscribed returns true if this peer (presumed Recv) wants to hear src.
 // nil subscription map means "subscribe all".
